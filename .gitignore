@@ -1,1 +1,34 @@
+
+# 1. Kredensial & File Rahasia (Paling Vital)
+
 .env
+*.pem
+*.key
+*secret*.json
+*credentials*.json
+*service-account*.json
+
+
+# 2. Artefak Kompilasi Golang & Cache
+
+/bin/
+/tmp/
+*.exe
+*.test
+*.prof
+*.tar.gz
+
+
+# 3. Direktori Editor & Sistem Operasi
+
+.idea/
+.vscode/
+.antigravity/
+.DS_Store
+Thumbs.db
+
+
+# 4. Log & File Sementara Lainnya
+
+*.log
+coverage.out

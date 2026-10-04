@@ -13,21 +13,21 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors" // Paket CORS telah diimpor dengan benar
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/handler"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
 )
 
 const (
-	defaultPort = "8080"
-
+	defaultPort       = "8080"
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 15 * time.Second
 	idleTimeout       = 60 * time.Second
-
 	shutdownTimeout   = 15 * time.Second
 	readyCheckTimeout = 2 * time.Second
 )
@@ -49,13 +49,12 @@ func main() {
 
 // run wires the dependencies and blocks until the server has shut down.
 func run(logger *slog.Logger) error {
-	// A missing .env file is not an error: deployed environments
-	// provide real environment variables instead.
 	_ = godotenv.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 1. Initialize Database Connection
 	pool, err := connectDatabase(ctx)
 	if err != nil {
 		return err
@@ -63,7 +62,13 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 	logger.Info("database connected")
 
-	srv := newServer(newRouter(pool))
+	// 2. Dependency Injection (Wiring Clean Architecture)
+	projectRepo := postgres.NewProjectRepository(pool)
+	projectHandler := handler.NewProjectHandler(projectRepo)
+
+	// 3. Initialize Router & Inject Handler
+	router := newRouter(pool, projectHandler)
+	srv := newServer(router)
 
 	return serve(ctx, logger, srv)
 }
@@ -81,27 +86,49 @@ func connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-func newRouter(db pinger) http.Handler {
+// newRouter sets up the HTTP routing, injects middlewares (termasuk CORS), dan mendaftarkan handlers.
+func newRouter(db pinger, projectHandler *handler.ProjectHandler) http.Handler {
 	r := chi.NewRouter()
 
+	// Injeksi Middleware CORS di posisi paling atas agar mencegat request pertama kali
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"https://*", "http://*"}, 
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300, // Durasi (detik) hasil preflight request (OPTIONS) disimpan di cache browser
+	}))
+
+	// Middlewares untuk pencatatan dan stabilitas
 	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(60 * time.Second))
 
+	// Rute Infrastruktur
 	r.Get("/healthz", handleHealthz)
 	r.Get("/readyz", handleReadyz(db))
+
+	// API v1 Routes
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Post("/projects", projectHandler.Create)
+		r.Get("/projects", projectHandler.List)
+		
+		r.Get("/projects/{id}", projectHandler.GetByID)
+		r.Put("/projects/{id}", projectHandler.Update)
+		r.Delete("/projects/{id}", projectHandler.Delete)
+	})
 
 	return r
 }
 
-// handleHealthz reports that the process is alive. It does not check
-// dependencies, because restarting the API cannot fix a failed database.
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
-// handleReadyz reports whether the API can serve traffic right now.
 func handleReadyz(db pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyCheckTimeout)
@@ -139,8 +166,6 @@ func serve(ctx context.Context, logger *slog.Logger, srv *http.Server) error {
 
 	g.Go(func() error {
 		logger.Info("http server started", "addr", srv.Addr)
-
-		// ErrServerClosed is the expected result of a call to Shutdown.
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("http serve: %w", err)
 		}
@@ -151,7 +176,6 @@ func serve(ctx context.Context, logger *slog.Logger, srv *http.Server) error {
 		<-gctx.Done()
 		logger.Info("shutdown started", "timeout", shutdownTimeout.String())
 
-		// The parent context is already cancelled, so shutdown needs its own.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 
