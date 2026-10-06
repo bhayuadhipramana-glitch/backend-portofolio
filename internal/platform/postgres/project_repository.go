@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/domain"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -62,6 +64,9 @@ func (r *ProjectRepository) GetByID(ctx context.Context, id int) (*domain.Projec
 	var p domain.Project
 	err := r.pool.QueryRow(ctx, query, id).Scan(&p.ID, &p.Title, &p.Description, &p.TechStack, &p.CreatedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("get project id %d: %w", id, domain.ErrNotFound)
+		}
 		return nil, fmt.Errorf("get project by id: %w", err)
 	}
 	return &p, nil
@@ -79,7 +84,7 @@ func (r *ProjectRepository) Update(ctx context.Context, p *domain.Project) error
 		return fmt.Errorf("update project query: %w", err)
 	}
 	if commandTag.RowsAffected() == 0 {
-		return fmt.Errorf("project with id %d not found", p.ID)
+		return fmt.Errorf("update project id %d: %w", p.ID, domain.ErrNotFound)
 	}
 	return nil
 }
@@ -92,7 +97,7 @@ func (r *ProjectRepository) Delete(ctx context.Context, id int) error {
 		return fmt.Errorf("delete project query: %w", err)
 	}
 	if commandTag.RowsAffected() == 0 {
-		return fmt.Errorf("project with id %d not found", id)
+		return fmt.Errorf("delete project id %d: %w", id, domain.ErrNotFound)
 	}
 	return nil
 }
