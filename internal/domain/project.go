@@ -16,6 +16,7 @@ type Project struct {
 	Description string    `json:"description"`
 	TechStack   []string  `json:"tech_stack"`
 	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // ProjectRepository adalah kontrak interface yang wajib dipenuhi oleh database adapter

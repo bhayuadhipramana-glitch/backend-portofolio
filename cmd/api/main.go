@@ -20,6 +20,7 @@ import (
 
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/handler"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/usecase"
 )
 
 const (
@@ -64,7 +65,11 @@ func run(logger *slog.Logger) error {
 
 	// 2. Dependency Injection (Wiring Clean Architecture)
 	projectRepo := postgres.NewProjectRepository(pool)
-	projectHandler := handler.NewProjectHandler(projectRepo)
+	projectUsecase, err := usecase.NewProjectUsecase(projectRepo)
+	if err != nil {
+		return fmt.Errorf("init project usecase: %w", err)
+	}
+	projectHandler := handler.NewProjectHandler(projectUsecase)
 
 	// 3. Initialize Router & Inject Handler
 	router := newRouter(pool, projectHandler)
