@@ -56,6 +56,12 @@ Reads that differ between visitors and the admin take a `domain.Visibility`; the
 - **Concurrency caps** (`middleware.ConnLimiter`, never blocking): 100 streams globally (`503` + `Retry-After`), 3 per client IP (`429`). Release the slot with `defer` the moment the handler returns.
 - Snapshot errors are logged and skipped; they never reach the client.
 
+## Demo Burst (F7)
+- `POST /api/v1/demo/burst` takes an optional body (`decodeOptionalJSON`, 1 KB cap, unknown fields rejected): `count` clamped 10..200 (default 100), `duration_ms` clamped 500..5000 (default 2000). Clamping lives in `domain.ClampDemoBurst`; out-of-range values are never errors.
+- It answers `202` at once. `usecase.DemoBurstUsecase` then publishes synthetic events (`source: "demo-burst"`, `page_view` 50 % / `api_read` 30 % / `cache_hit` 20 %) in 100 ms slices through the normal `EventUsecase`, so they travel NATS -> worker -> Postgres -> SSE like real traffic. Never write demo events straight to the database.
+- **Abuse protection, both required:** a sliding-window per-IP limit of 2 bursts/minute (`middleware.WindowLimiter`, `429` + `Retry-After`; it is deliberately not a token bucket, which would allow 3 in the first minute) and a server-wide semaphore of 2 concurrent bursts (`domain.DemoMaxConcurrency`, `503` + `Retry-After` when busy). The limiter runs before the usecase, so a throttled visitor never reaches NATS.
+- Bursts run on the process context passed to `NewDemoBurstUsecase`, not the request context, so they survive the 202 response and stop on shutdown. `main` calls `Wait` before draining NATS.
+
 ## Database & Migration Rules (PostgreSQL 17)
 - Single source of truth for schema: `migrations/` (`000001_name.up.sql` and `.down.sql`). Do NOT create `db/migrations/`.
 - Always use parameterized queries (`$1`, `$2`). Never concatenate user input into SQL strings.

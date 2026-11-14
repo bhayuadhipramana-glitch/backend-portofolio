@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -77,4 +78,26 @@ func parsePage(w http.ResponseWriter, r *http.Request) (domain.Page, bool) {
 		page.Offset = n
 	}
 	return page, true
+}
+
+// decodeOptionalJSON is decodeJSON for endpoints whose body may be omitted: an
+// empty body leaves dst untouched (its defaults) and succeeds. The body is read
+// under the same cap first, so an oversized body is still a 413.
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			response.Error(w, http.StatusRequestEntityTooLarge, "request body too large", nil)
+		} else {
+			response.Error(w, http.StatusBadRequest, "invalid request body", nil)
+		}
+		return false
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return true
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return decodeJSONLimit(w, r, dst, limit)
 }

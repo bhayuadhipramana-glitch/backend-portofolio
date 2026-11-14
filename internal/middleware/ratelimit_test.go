@@ -81,3 +81,73 @@ func TestRateLimiterMiddleware429(t *testing.T) {
 		t.Fatalf("other IP got %d", rec.Code)
 	}
 }
+
+func TestWindowLimiterIsStrictPerWindow(t *testing.T) {
+	now := time.Unix(5_000, 0)
+	l := newWindowLimiter(2, time.Minute, func() time.Time { return now })
+
+	if ok, _ := l.Allow("ip"); !ok {
+		t.Fatal("first hit denied")
+	}
+	now = now.Add(20 * time.Second)
+	if ok, _ := l.Allow("ip"); !ok {
+		t.Fatal("second hit denied")
+	}
+	now = now.Add(20 * time.Second) // t=40s: still inside the first hit's window
+	ok, wait := l.Allow("ip")
+	if ok {
+		t.Fatal("third hit within a minute must be denied")
+	}
+	if wait != 20*time.Second {
+		t.Fatalf("retry-after = %v, want 20s (until the first hit expires)", wait)
+	}
+	if ok, _ := l.Allow("other"); !ok {
+		t.Fatal("another IP has its own window")
+	}
+
+	now = now.Add(21 * time.Second) // t=61s: first hit expired, second has not
+	if ok, _ := l.Allow("ip"); !ok {
+		t.Fatal("a slot must open once the oldest hit leaves the window")
+	}
+	if ok, _ := l.Allow("ip"); ok {
+		t.Fatal("only one slot should have opened")
+	}
+}
+
+func TestWindowLimiterBoundsMemory(t *testing.T) {
+	now := time.Unix(5_000, 0)
+	l := newWindowLimiter(1, time.Minute, func() time.Time { return now })
+	for i := 0; i < maxLimiterKeys+50; i++ {
+		l.Allow("ip-" + strconv.Itoa(i))
+	}
+	if len(l.hits) > maxLimiterKeys+1 {
+		t.Fatalf("table grew to %d", len(l.hits))
+	}
+	now = now.Add(3 * time.Minute)
+	l.Allow("fresh")
+	if len(l.hits) != 1 {
+		t.Fatalf("expired entries were not swept: %d left", len(l.hits))
+	}
+}
+
+func TestWindowLimiterMiddleware429(t *testing.T) {
+	h := NewWindowLimiter(2, time.Minute).Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	do := func(addr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		req.RemoteAddr = addr
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	do("203.0.113.1:1")
+	do("203.0.113.1:2")
+	rec := do("203.0.113.1:3")
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("got %d / %q, want 429 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if do("203.0.113.2:1").Code != http.StatusAccepted {
+		t.Fatal("another IP was throttled")
+	}
+}

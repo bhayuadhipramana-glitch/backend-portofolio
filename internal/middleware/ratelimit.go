@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"math"
-	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -101,13 +100,14 @@ func (l *RateLimiter) sweep(now time.Time) {
 
 // Middleware rejects requests over the limit with 429 and a Retry-After header.
 func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.RemoteAddr
-		if host, _, err := net.SplitHostPort(key); err == nil {
-			key = host
-		}
+	return limitByIP(l.Allow, next)
+}
 
-		if ok, wait := l.Allow(key); !ok {
+// limitByIP admits a request when allow(ip) says so and otherwise answers 429
+// with Retry-After.
+func limitByIP(allow func(key string) (bool, time.Duration), next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ok, wait := allow(IPKey(r.RemoteAddr)); !ok {
 			secs := int(math.Ceil(wait.Seconds()))
 			w.Header().Set("Retry-After", strconv.Itoa(max(secs, 1)))
 			response.Error(w, http.StatusTooManyRequests, "too many requests", nil)
@@ -115,4 +115,69 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// WindowLimiter allows at most max requests per client IP in any sliding
+// window. Unlike a token bucket it gives no extra allowance after a pause, so
+// "2 per minute" really means 2 in every 60 seconds.
+type WindowLimiter struct {
+	max    int
+	window time.Duration
+	now    func() time.Time
+
+	mu      sync.Mutex
+	hits    map[string][]time.Time
+	sweptAt time.Time
+}
+
+// NewWindowLimiter creates a sliding-window limiter.
+func NewWindowLimiter(max int, window time.Duration) *WindowLimiter {
+	return newWindowLimiter(max, window, time.Now)
+}
+
+func newWindowLimiter(max int, window time.Duration, now func() time.Time) *WindowLimiter {
+	return &WindowLimiter{max: max, window: window, now: now, hits: make(map[string][]time.Time)}
+}
+
+// Allow records a hit for key when it is within the limit. When it is denied,
+// retryAfter says when the oldest hit leaves the window.
+func (l *WindowLimiter) Allow(key string) (ok bool, retryAfter time.Duration) {
+	now := l.now()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if now.Sub(l.sweptAt) > time.Minute {
+		for k, h := range l.hits {
+			if len(l.prune(h, now)) == 0 {
+				delete(l.hits, k)
+			}
+		}
+		l.sweptAt = now
+	}
+
+	if _, known := l.hits[key]; !known && len(l.hits) >= maxLimiterKeys {
+		key = overflowKey // table full: share one bucket instead of growing
+	}
+	h := l.prune(l.hits[key], now)
+	if len(h) >= l.max {
+		l.hits[key] = h
+		return false, h[0].Add(l.window).Sub(now)
+	}
+	l.hits[key] = append(h, now)
+	return true, 0
+}
+
+// prune drops hits that left the window. h is ordered oldest first.
+func (l *WindowLimiter) prune(h []time.Time, now time.Time) []time.Time {
+	i := 0
+	for i < len(h) && now.Sub(h[i]) >= l.window {
+		i++
+	}
+	return h[i:]
+}
+
+// Middleware rejects requests over the limit with 429 and a Retry-After header.
+func (l *WindowLimiter) Middleware(next http.Handler) http.Handler {
+	return limitByIP(l.Allow, next)
 }

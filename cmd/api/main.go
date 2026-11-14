@@ -19,6 +19,7 @@ import (
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/domain"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/handler"
 	authmw "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/middleware"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/github"
@@ -40,6 +41,10 @@ const (
 	// events, so this allows a sustained 1,000 events/s per client.
 	eventRatePerSecond = 10
 	eventBurst         = 20
+
+	// F7 abuse protection: bursts per client IP per minute. The server-wide cap
+	// on concurrent bursts is domain.DemoMaxConcurrency.
+	demoBurstsPerIP = 2
 
 	// SSE guardrails: total concurrent live-feed clients and the share per IP.
 	maxStreamClients = 100
@@ -142,6 +147,13 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init live stats usecase: %w", err)
 	}
 
+	// F7 bursts publish through the same F3 usecase. They are bound to ctx, so a
+	// shutdown signal stops them, and run in the background of the request.
+	demoUsecase, err := usecase.NewDemoBurstUsecase(ctx, eventUsecase, domain.DemoMaxConcurrency)
+	if err != nil {
+		return fmt.Errorf("init demo burst usecase: %w", err)
+	}
+
 	// 5. Router and handlers.
 	router := newRouter(routerDeps{
 		db:              pool,
@@ -154,6 +166,8 @@ func run(logger *slog.Logger) error {
 		profileHandler:  handler.NewProfileHandler(profileUsecase),
 		resumeHandler:   handler.NewResumeHandler(resumeUsecase),
 		eventHandler:    handler.NewEventHandler(eventUsecase),
+		demoHandler:     handler.NewDemoHandler(demoUsecase),
+		demoLimiter:     authmw.NewWindowLimiter(demoBurstsPerIP, time.Minute).Middleware,
 		streamHandler:   handler.NewStreamHandler(liveStatsUsecase, authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)),
 		eventLimiter:    authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
 		authHandler:     handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
@@ -181,6 +195,11 @@ func run(logger *slog.Logger) error {
 	// Shutdown order: stop the HTTP server (done), let the worker finish its
 	// in-flight batch, then drain NATS; the deferred pool.Close runs last.
 	stop()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelWait()
+	if err := demoUsecase.Wait(waitCtx); err != nil {
+		logger.Warn("demo bursts did not stop in time", "error", err)
+	}
 	select {
 	case <-workerDone:
 	case <-time.After(shutdownTimeout):
@@ -212,6 +231,8 @@ type routerDeps struct {
 	profileHandler  *handler.ProfileHandler
 	resumeHandler   *handler.ResumeHandler
 	eventHandler    *handler.EventHandler
+	demoHandler     *handler.DemoHandler
+	demoLimiter     func(http.Handler) http.Handler // per-IP sliding-window limit for demo bursts
 	streamHandler   *handler.StreamHandler          // F5 SSE live feed, exempt from the request timeout
 	eventLimiter    func(http.Handler) http.Handler // per-IP rate limit for event ingest
 	authHandler     *handler.AuthHandler
@@ -296,6 +317,17 @@ func newRouter(d routerDeps) http.Handler {
 					r.Use(d.eventLimiter)
 				}
 				r.Post("/events", d.eventHandler.Ingest)
+			})
+		}
+
+		// F7 public demo burst: strict per-IP window plus a server-wide cap on
+		// concurrent bursts (enforced in the usecase), both before NATS is touched.
+		if d.demoHandler != nil {
+			r.Group(func(r chi.Router) {
+				if d.demoLimiter != nil {
+					r.Use(d.demoLimiter)
+				}
+				r.Post("/demo/burst", d.demoHandler.Burst)
 			})
 		}
 
