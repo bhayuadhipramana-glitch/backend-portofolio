@@ -1,16 +1,12 @@
 // Package handler contains HTTP handlers that sit at the outermost layer
-// of the Clean Architecture onion. Handlers decode requests, delegate to
-// the usecase layer, and encode standardised JSON responses.
+// of the application. Handlers decode requests, delegate to the usecase
+// layer, and encode standardised JSON responses.
 package handler
 
 import (
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
-
-	"github.com/go-chi/chi/v5"
 
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/domain"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/dto"
@@ -30,18 +26,13 @@ func NewProjectHandler(uc usecase.ProjectUsecase) *ProjectHandler {
 }
 
 // Create handles POST /api/v1/projects.
-//
-// It decodes the request body into a CreateProjectRequest DTO, validates it,
-// persists the entity through the usecase, and returns the created project.
 func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req dto.CreateProjectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		slog.WarnContext(r.Context(), "handler: invalid JSON body", "error", err)
-		response.Error(w, http.StatusBadRequest, "invalid request body", nil)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
-	// Validate the DTO — returns nil when all rules pass.
+	// Validate the DTO; nil means all rules pass.
 	if errs := dto.Validate(&req); errs != nil {
 		response.Error(w, http.StatusBadRequest, "validation failed", errs)
 		return
@@ -62,12 +53,14 @@ func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, http.StatusCreated, "project created successfully", p)
 }
 
-// List handles GET /api/v1/projects.
-//
-// It retrieves every project from the usecase and returns them as a JSON
-// array inside the standard success envelope.
+// List handles GET /api/v1/projects?limit=&offset=.
 func (h *ProjectHandler) List(w http.ResponseWriter, r *http.Request) {
-	projects, err := h.uc.List(r.Context())
+	page, ok := parsePage(w, r)
+	if !ok {
+		return
+	}
+
+	projects, err := h.uc.List(r.Context(), page)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "handler: list projects failed", "error", err)
 		response.Error(w, http.StatusInternalServerError, "failed to fetch projects", nil)
@@ -83,18 +76,14 @@ func (h *ProjectHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetByID handles GET /api/v1/projects/{id}.
-//
-// It parses the path parameter, queries the usecase, and returns either
-// the project or an appropriate error response.
 func (h *ProjectHandler) GetByID(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r)
+	id, ok := parseUUIDParam(w, r)
 	if !ok {
-		return // parseIDParam already wrote the error response
+		return // parseUUIDParam already wrote the error response
 	}
 
 	project, err := h.uc.GetByID(r.Context(), id)
 	if err != nil {
-		// Differentiate between "not found" and unexpected DB errors.
 		if isNotFound(err) {
 			response.Error(w, http.StatusNotFound, "project not found", nil)
 			return
@@ -108,19 +97,14 @@ func (h *ProjectHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 }
 
 // Update handles PUT /api/v1/projects/{id}.
-//
-// It parses the path parameter, decodes & validates the request body,
-// then updates the entity through the usecase.
 func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r)
+	id, ok := parseUUIDParam(w, r)
 	if !ok {
 		return
 	}
 
 	var req dto.UpdateProjectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		slog.WarnContext(r.Context(), "handler: invalid JSON body", "error", err)
-		response.Error(w, http.StatusBadRequest, "invalid request body", nil)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -150,11 +134,8 @@ func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 }
 
 // Delete handles DELETE /api/v1/projects/{id}.
-//
-// It parses the path parameter, deletes the entity through the usecase,
-// and returns a confirmation message.
 func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r)
+	id, ok := parseUUIDParam(w, r)
 	if !ok {
 		return
 	}
@@ -172,27 +153,7 @@ func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, http.StatusOK, "project deleted successfully", nil)
 }
 
-// ---------- internal helpers ----------
-
-// parseIDParam extracts and validates the {id} URL parameter.
-// It writes a 400 error response and returns false when the value is invalid.
-func parseIDParam(w http.ResponseWriter, r *http.Request) (int, bool) {
-	idStr := chi.URLParam(r, "id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil || id <= 0 {
-		response.Error(w, http.StatusBadRequest, "invalid project id", nil)
-		return 0, false
-	}
-	return id, true
-}
-
-// isNotFound returns true when the error message indicates the requested
-// entity does not exist.  This is a pragmatic approach that avoids coupling
-// the handler to concrete repository error types while the project is small.
-// In a larger code-base you would define sentinel errors in the domain layer.
+// isNotFound reports whether err wraps domain.ErrNotFound.
 func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
 	return errors.Is(err, domain.ErrNotFound)
 }

@@ -13,21 +13,25 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors" // Paket CORS telah diimpor dengan benar
+	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/handler"
+	authmw "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/middleware"
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/github"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/usecase"
 )
 
 const (
-	defaultPort       = "8080"
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 10 * time.Second
-	writeTimeout      = 15 * time.Second
+	// writeTimeout must stay above requestTimeout so a handler that hits its
+	// deadline can still write the 503 response before the connection closes.
+	writeTimeout      = 30 * time.Second
+	requestTimeout    = 25 * time.Second
 	idleTimeout       = 60 * time.Second
 	shutdownTimeout   = 15 * time.Second
 	readyCheckTimeout = 2 * time.Second
@@ -55,35 +59,64 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 1. Initialize Database Connection
-	pool, err := connectDatabase(ctx)
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	// 1. Database connection.
+	pool, err := connectDatabase(ctx, cfg.databaseURL)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-	logger.Info("database connected")
+	logger.Info("database connected", "app_env", cfg.appEnv)
 
-	// 2. Dependency Injection (Wiring Clean Architecture)
-	projectRepo := postgres.NewProjectRepository(pool)
-	projectUsecase, err := usecase.NewProjectUsecase(projectRepo)
+	// 2. Dependency injection: repository -> usecase -> handler.
+	projectUsecase, err := usecase.NewProjectUsecase(postgres.NewProjectRepository(pool))
 	if err != nil {
 		return fmt.Errorf("init project usecase: %w", err)
 	}
-	projectHandler := handler.NewProjectHandler(projectUsecase)
 
-	// 3. Initialize Router & Inject Handler
-	router := newRouter(pool, projectHandler)
-	srv := newServer(router)
-
-	return serve(ctx, logger, srv)
-}
-
-func connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
-	dsn := os.Getenv("DB_DSN")
-	if dsn == "" {
-		return nil, errors.New("environment variable DB_DSN is not set")
+	articleUsecase, err := usecase.NewArticleUsecase(postgres.NewArticleRepository(pool))
+	if err != nil {
+		return fmt.Errorf("init article usecase: %w", err)
 	}
 
+	profileUsecase, err := usecase.NewProfileUsecase(postgres.NewProfileRepository(pool))
+	if err != nil {
+		return fmt.Errorf("init profile usecase: %w", err)
+	}
+
+	resumeUsecase, err := usecase.NewResumeUsecase(postgres.NewResumeRepository(pool))
+	if err != nil {
+		return fmt.Errorf("init resume usecase: %w", err)
+	}
+
+	githubClient := github.New(cfg.clientID, cfg.clientSecret, cfg.redirectURL)
+	authUsecase, err := usecase.NewAuthUsecase(githubClient, postgres.NewSessionRepository(pool), cfg.adminGithubID, sessionTTL)
+	if err != nil {
+		return fmt.Errorf("init auth usecase: %w", err)
+	}
+
+	// 3. Router and handlers.
+	router := newRouter(routerDeps{
+		db:              pool,
+		appEnv:          cfg.appEnv,
+		trustCloudflare: cfg.trustCloudflare,
+		projectHandler:  handler.NewProjectHandler(projectUsecase),
+		articleHandler:  handler.NewArticleHandler(articleUsecase),
+		profileHandler:  handler.NewProfileHandler(profileUsecase),
+		resumeHandler:   handler.NewResumeHandler(resumeUsecase),
+		authHandler:     handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
+		authenticator:   authUsecase,
+		allowedOrigins:  cfg.allowedOrigin,
+	})
+
+	return serve(ctx, logger, newServer(router, cfg.port))
+}
+
+func connectDatabase(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	pool, err := postgres.Setup(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)
@@ -91,39 +124,101 @@ func connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// newRouter sets up the HTTP routing, injects middlewares (termasuk CORS), dan mendaftarkan handlers.
-func newRouter(db pinger, projectHandler *handler.ProjectHandler) http.Handler {
+// routerDeps carries everything newRouter needs to build the HTTP routes.
+type routerDeps struct {
+	db              pinger
+	appEnv          string
+	trustCloudflare bool
+	projectHandler  *handler.ProjectHandler
+	articleHandler  *handler.ArticleHandler
+	profileHandler  *handler.ProfileHandler
+	resumeHandler   *handler.ResumeHandler
+	authHandler     *handler.AuthHandler
+	authenticator   authmw.Authenticator
+	allowedOrigins  []string
+}
+
+func newRouter(d routerDeps) http.Handler {
 	r := chi.NewRouter()
 
-	// Injeksi Middleware CORS di posisi paling atas agar mencegat request pertama kali
+	// CORS goes first so it intercepts preflight requests. Origins must be
+	// explicit: with AllowCredentials a wildcard would let any site use the
+	// admin session cookie.
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://*", "http://*"}, 
+		AllowedOrigins:   d.allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
-		MaxAge:           300, // Durasi (detik) hasil preflight request (OPTIONS) disimpan di cache browser
+		MaxAge:           300, // seconds a browser may cache the preflight result
 	}))
 
-	// Middlewares untuk pencatatan dan stabilitas
+	// Logging and stability middleware. ClientIP replaces chi's RealIP: it only
+	// trusts CF-Connecting-IP, and only when running behind Cloudflare Tunnel.
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(authmw.ClientIP(d.trustCloudflare))
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(middleware.Timeout(requestTimeout))
 
-	// Rute Infrastruktur
+	// Infrastructure routes.
 	r.Get("/healthz", handleHealthz)
-	r.Get("/readyz", handleReadyz(db))
+	r.Get("/readyz", handleReadyz(d.db))
 
-	// API v1 Routes
+	requireAdmin := authmw.RequireAdmin(d.authenticator, d.appEnv)
+	trustedOrigin := authmw.TrustedOrigin(d.allowedOrigins)
+
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Post("/projects", projectHandler.Create)
-		r.Get("/projects", projectHandler.List)
-		
-		r.Get("/projects/{id}", projectHandler.GetByID)
-		r.Put("/projects/{id}", projectHandler.Update)
-		r.Delete("/projects/{id}", projectHandler.Delete)
+		// Auth: the login flow is public; session inspection and logout need a session.
+		r.Route("/auth", func(r chi.Router) {
+			r.Get("/github/login", d.authHandler.Login)
+			r.Get("/github/callback", d.authHandler.Callback)
+
+			r.Group(func(r chi.Router) {
+				r.Use(trustedOrigin, requireAdmin)
+				r.Get("/me", d.authHandler.Me)
+				r.Post("/logout", d.authHandler.Logout)
+			})
+		})
+
+		// Public reads: published articles and the active profile/resume only.
+		// Lists accept ?limit= (default 20, max 100) and ?offset=.
+		r.Get("/projects", d.projectHandler.List)
+		r.Get("/projects/{id}", d.projectHandler.GetByID)
+		r.Get("/articles", d.articleHandler.List)
+		r.Get("/articles/{id}", d.articleHandler.GetByID) // {id} is a UUID or a slug
+		r.Get("/profiles", d.profileHandler.List)
+		r.Get("/profiles/{id}", d.profileHandler.GetByID)
+		r.Get("/resumes", d.resumeHandler.List)
+		r.Get("/resumes/{id}", d.resumeHandler.GetByID)
+
+		// Admin-only: unfiltered reads and all mutations.
+		r.Group(func(r chi.Router) {
+			r.Use(trustedOrigin, requireAdmin)
+
+			r.Get("/admin/articles", d.articleHandler.AdminList)
+			r.Get("/admin/articles/{id}", d.articleHandler.AdminGetByID)
+			r.Get("/admin/profiles", d.profileHandler.AdminList)
+			r.Get("/admin/profiles/{id}", d.profileHandler.AdminGetByID)
+			r.Get("/admin/resumes", d.resumeHandler.AdminList)
+			r.Get("/admin/resumes/{id}", d.resumeHandler.AdminGetByID)
+
+			r.Post("/projects", d.projectHandler.Create)
+			r.Put("/projects/{id}", d.projectHandler.Update)
+			r.Delete("/projects/{id}", d.projectHandler.Delete)
+
+			r.Post("/articles", d.articleHandler.Create)
+			r.Put("/articles/{id}", d.articleHandler.Update)
+			r.Delete("/articles/{id}", d.articleHandler.Delete)
+
+			r.Post("/profiles", d.profileHandler.Create)
+			r.Put("/profiles/{id}", d.profileHandler.Update)
+			r.Delete("/profiles/{id}", d.profileHandler.Delete)
+
+			r.Post("/resumes", d.resumeHandler.Create)
+			r.Put("/resumes/{id}", d.resumeHandler.Update)
+			r.Delete("/resumes/{id}", d.resumeHandler.Delete)
+		})
 	})
 
 	return r
@@ -149,12 +244,7 @@ func handleReadyz(db pinger) http.HandlerFunc {
 	}
 }
 
-func newServer(handler http.Handler) *http.Server {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = defaultPort
-	}
-
+func newServer(handler http.Handler, port string) *http.Server {
 	return &http.Server{
 		Addr:              ":" + port,
 		Handler:           handler,
