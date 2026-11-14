@@ -7,21 +7,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Setup menginisialisasi dan memvalidasi koneksi ke PostgreSQL
+// Setup creates a connection pool and verifies the database is reachable.
 func Setup(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("gagal membedah DSN: %w", err)
+		return nil, fmt.Errorf("parse database url: %w", err)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		return nil, fmt.Errorf("gagal membuat kolam koneksi: %w", err)
+		return nil, fmt.Errorf("create connection pool: %w", err)
 	}
 
-	// Uji denyut (ping) untuk memastikan database benar-benar hidup
+	// Ping so a dead database fails at startup rather than on the first request.
 	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("gagal melakukan ping ke database: %w", err)
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
 	return pool, nil
