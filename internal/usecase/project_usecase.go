@@ -24,16 +24,20 @@ type ProjectUsecase interface {
 
 // projectUsecase is the concrete implementation of ProjectUsecase.
 type projectUsecase struct {
-	repo domain.ProjectRepository
+	repo  domain.ProjectRepository
+	cache domain.ContentCache
 }
 
 // NewProjectUsecase constructs a ProjectUsecase with its required repository
-// dependency. It returns an error if repo is nil to fail fast during wiring.
-func NewProjectUsecase(repo domain.ProjectRepository) (ProjectUsecase, error) {
+// dependencies. It returns an error if repo or cache is nil to fail fast during wiring.
+func NewProjectUsecase(repo domain.ProjectRepository, cache domain.ContentCache) (ProjectUsecase, error) {
 	if repo == nil {
 		return nil, errors.New("usecase: project repository must not be nil")
 	}
-	return &projectUsecase{repo: repo}, nil
+	if cache == nil {
+		return nil, errors.New("usecase: project cache must not be nil")
+	}
+	return &projectUsecase{repo: repo, cache: cache}, nil
 }
 
 // Create persists a new project.
@@ -41,12 +45,19 @@ func (u *projectUsecase) Create(ctx context.Context, p *domain.Project) error {
 	if p == nil {
 		return errors.New("usecase: project must not be nil")
 	}
-	return u.repo.Create(ctx, p)
+	if err := u.repo.Create(ctx, p); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceProjects)
+	return nil
 }
 
 // List retrieves one page of projects.
 func (u *projectUsecase) List(ctx context.Context, page domain.Page) ([]domain.Project, error) {
-	return u.repo.List(ctx, page.Normalize())
+	page = page.Normalize()
+	return cached(ctx, u.cache, domain.CacheNamespaceProjects, listKey(page), func(ctx context.Context) ([]domain.Project, error) {
+		return u.repo.List(ctx, page)
+	})
 }
 
 // GetByID retrieves a single project. Returns domain.ErrNotFound (wrapped) when
@@ -55,7 +66,9 @@ func (u *projectUsecase) GetByID(ctx context.Context, id string) (*domain.Projec
 	if id == "" {
 		return nil, fmt.Errorf("usecase: invalid project id %q", id)
 	}
-	return u.repo.GetByID(ctx, id)
+	return cached(ctx, u.cache, domain.CacheNamespaceProjects, "id:"+id, func(ctx context.Context) (*domain.Project, error) {
+		return u.repo.GetByID(ctx, id)
+	})
 }
 
 // Update replaces the full representation of a project.
@@ -66,7 +79,11 @@ func (u *projectUsecase) Update(ctx context.Context, p *domain.Project) error {
 	if p.ID == "" {
 		return fmt.Errorf("usecase: invalid project id %q", p.ID)
 	}
-	return u.repo.Update(ctx, p)
+	if err := u.repo.Update(ctx, p); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceProjects)
+	return nil
 }
 
 // Delete removes a project by its identifier.
@@ -74,5 +91,9 @@ func (u *projectUsecase) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("usecase: invalid project id %q", id)
 	}
-	return u.repo.Delete(ctx, id)
+	if err := u.repo.Delete(ctx, id); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceProjects)
+	return nil
 }

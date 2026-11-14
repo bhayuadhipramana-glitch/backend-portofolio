@@ -21,10 +21,22 @@ Actual package layout (do NOT rename or move to `internal/adapter/*`):
 - `internal/pkg/response`: Shared JSON response envelope.
 - `internal/platform/postgres`: `pgxpool` implementations of domain repositories.
 - `internal/platform/github`: GitHub OAuth2 implementation of `domain.IdentityProvider`.
-- Future adapters follow the same pattern: `internal/platform/valkey`, `internal/platform/nats`.
+- `internal/platform/valkey`: `domain.ContentCache` as a two-layer cache (see Caching Conventions).
+- Future adapters follow the same pattern: `internal/platform/nats`.
 - `cmd/api`: Process entrypoint, environment config (`config.go`), router and dependency wiring.
 
 Reads that differ between visitors and the admin take a `domain.Visibility`; the zero value is `VisibilityPublic`, so a forgotten argument fails closed. Admin-only reads live under `/api/v1/admin/...`.
+
+## Caching Conventions (F1, Valkey 8)
+- `domain.ContentCache` (`Fetch`, `Invalidate`, `Ping`) is the only cache API usecases see. It deals in `[]byte`; usecases use the generic helper `cached[T]` and `invalidate` in `internal/usecase/cache.go`.
+- **L1** in-process: 3 s TTL, max 512 entries, `sync.RWMutex`, `singleflight` per key. **L2** Valkey: 120 s TTL + up to 10 % random jitter, JSON values, keys `cache:<namespace>:v<version>:<key>`.
+- Namespaces: `projects`, `articles`, `profiles`, `resumes` (`domain.CacheNamespace*`). Cache keys are built in the usecase (`list:<limit>:<offset>`, `id:<id>`, `slug:<slug>`), never in handlers.
+- Only `VisibilityPublic` reads are cached; admin (`VisibilityAll`) reads always hit PostgreSQL.
+- Every admin `Create`/`Update`/`Delete` must call `invalidate(ctx, u.cache, <namespace>)` after the repository write succeeds. This bumps the namespace version in Valkey (`cache:ver:<namespace>`) and clears local L1. A new mutation without it serves stale data.
+- Valkey is optional at runtime: an outage falls back to the database (5 s circuit-breaker cooldown, 200 ms per Valkey call) and `/readyz` answers 200 `ready (cache degraded)`. Valkey is required at startup (`VALKEY_ADDR`, default `127.0.0.1:6379`).
+- Public content GETs carry `X-Cache: HIT-L1 | HIT-L2 | MISS` via `middleware.CacheStatus`. Cache errors are never leaked to clients.
+- Valkey runs with `--maxmemory 128mb --maxmemory-policy allkeys-lru`, no persistence. Never store secrets, sessions or admin data in it.
+- Benchmark: `k6 run loadtest/f1_read_p99.js` (thresholds: p99 < 50 ms, failures < 0.1 %).
 
 ## Database & Migration Rules (PostgreSQL 17)
 - Single source of truth for schema: `migrations/` (`000001_name.up.sql` and `.down.sql`). Do NOT create `db/migrations/`.

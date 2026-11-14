@@ -38,7 +38,7 @@ func (r *recordingArticles) Create(_ context.Context, a *domain.Article) error {
 func TestArticleUsecaseForwardsVisibilityAndBoundsPage(t *testing.T) {
 	ctx := context.Background()
 	repo := &recordingArticles{}
-	uc, err := NewArticleUsecase(repo)
+	uc, err := NewArticleUsecase(repo, domain.NopCache{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestArticleUsecaseForwardsVisibilityAndBoundsPage(t *testing.T) {
 
 func TestArticleUsecaseStampsPublishedAt(t *testing.T) {
 	repo := &recordingArticles{}
-	uc, _ := NewArticleUsecase(repo)
+	uc, _ := NewArticleUsecase(repo, domain.NopCache{})
 
 	pub := &domain.Article{Status: domain.ArticleStatusPublished}
 	if err := uc.Create(context.Background(), pub); err != nil {
@@ -132,8 +132,8 @@ func (r *recordingResumes) GetByID(_ context.Context, vis domain.Visibility, _ s
 func TestProfileAndResumeUsecasesForwardVisibilityAndBoundsPage(t *testing.T) {
 	ctx := context.Background()
 	pr, rr := &recordingProfiles{}, &recordingResumes{}
-	pu, _ := NewProfileUsecase(pr)
-	ru, _ := NewResumeUsecase(rr)
+	pu, _ := NewProfileUsecase(pr, domain.NopCache{})
+	ru, _ := NewResumeUsecase(rr, domain.NopCache{})
 
 	for _, vis := range []domain.Visibility{domain.VisibilityPublic, domain.VisibilityAll} {
 		if _, err := pu.List(ctx, vis, domain.Page{Limit: 9999}); err != nil {

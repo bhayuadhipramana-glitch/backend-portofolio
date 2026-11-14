@@ -22,16 +22,20 @@ type ArticleUsecase interface {
 
 // articleUsecase is the concrete implementation of ArticleUsecase.
 type articleUsecase struct {
-	repo domain.ArticleRepository
+	repo  domain.ArticleRepository
+	cache domain.ContentCache
 }
 
 // NewArticleUsecase constructs an ArticleUsecase with its required repository
-// dependency. It returns an error if repo is nil to fail fast during wiring.
-func NewArticleUsecase(repo domain.ArticleRepository) (ArticleUsecase, error) {
+// dependencies. It returns an error if repo or cache is nil to fail fast during wiring.
+func NewArticleUsecase(repo domain.ArticleRepository, cache domain.ContentCache) (ArticleUsecase, error) {
 	if repo == nil {
 		return nil, errors.New("usecase: article repository must not be nil")
 	}
-	return &articleUsecase{repo: repo}, nil
+	if cache == nil {
+		return nil, errors.New("usecase: article cache must not be nil")
+	}
+	return &articleUsecase{repo: repo, cache: cache}, nil
 }
 
 // Create persists a new article.
@@ -40,12 +44,22 @@ func (u *articleUsecase) Create(ctx context.Context, a *domain.Article) error {
 		return errors.New("usecase: article must not be nil")
 	}
 	stampPublishedAt(a)
-	return u.repo.Create(ctx, a)
+	if err := u.repo.Create(ctx, a); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceArticles)
+	return nil
 }
 
 // List retrieves one page of articles.
 func (u *articleUsecase) List(ctx context.Context, vis domain.Visibility, page domain.Page) ([]domain.Article, error) {
-	return u.repo.List(ctx, vis, page.Normalize())
+	page = page.Normalize()
+	if vis != domain.VisibilityPublic {
+		return u.repo.List(ctx, vis, page) // admin reads are never cached
+	}
+	return cached(ctx, u.cache, domain.CacheNamespaceArticles, listKey(page), func(ctx context.Context) ([]domain.Article, error) {
+		return u.repo.List(ctx, vis, page)
+	})
 }
 
 // GetByID retrieves a single article. Returns domain.ErrNotFound (wrapped) when
@@ -54,7 +68,12 @@ func (u *articleUsecase) GetByID(ctx context.Context, vis domain.Visibility, id 
 	if id == "" {
 		return nil, fmt.Errorf("usecase: invalid article id %q", id)
 	}
-	return u.repo.GetByID(ctx, vis, id)
+	if vis != domain.VisibilityPublic {
+		return u.repo.GetByID(ctx, vis, id)
+	}
+	return cached(ctx, u.cache, domain.CacheNamespaceArticles, "id:"+id, func(ctx context.Context) (*domain.Article, error) {
+		return u.repo.GetByID(ctx, vis, id)
+	})
 }
 
 // GetBySlug retrieves a single article by slug. Returns domain.ErrNotFound
@@ -63,7 +82,12 @@ func (u *articleUsecase) GetBySlug(ctx context.Context, vis domain.Visibility, s
 	if slug == "" {
 		return nil, fmt.Errorf("usecase: invalid article slug %q", slug)
 	}
-	return u.repo.GetBySlug(ctx, vis, slug)
+	if vis != domain.VisibilityPublic {
+		return u.repo.GetBySlug(ctx, vis, slug)
+	}
+	return cached(ctx, u.cache, domain.CacheNamespaceArticles, "slug:"+slug, func(ctx context.Context) (*domain.Article, error) {
+		return u.repo.GetBySlug(ctx, vis, slug)
+	})
 }
 
 // Update replaces the full representation of an article.
@@ -75,7 +99,11 @@ func (u *articleUsecase) Update(ctx context.Context, a *domain.Article) error {
 		return fmt.Errorf("usecase: invalid article id %q", a.ID)
 	}
 	stampPublishedAt(a)
-	return u.repo.Update(ctx, a)
+	if err := u.repo.Update(ctx, a); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceArticles)
+	return nil
 }
 
 // Delete removes an article by its identifier.
@@ -83,7 +111,11 @@ func (u *articleUsecase) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("usecase: invalid article id %q", id)
 	}
-	return u.repo.Delete(ctx, id)
+	if err := u.repo.Delete(ctx, id); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceArticles)
+	return nil
 }
 
 // stampPublishedAt sets PublishedAt to now when an article is being published

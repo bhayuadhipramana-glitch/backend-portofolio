@@ -20,16 +20,20 @@ type ResumeUsecase interface {
 
 // resumeUsecase is the concrete implementation of ResumeUsecase.
 type resumeUsecase struct {
-	repo domain.ResumeRepository
+	repo  domain.ResumeRepository
+	cache domain.ContentCache
 }
 
 // NewResumeUsecase constructs a ResumeUsecase with its required repository
-// dependency. It returns an error if repo is nil to fail fast during wiring.
-func NewResumeUsecase(repo domain.ResumeRepository) (ResumeUsecase, error) {
+// dependencies. It returns an error if repo or cache is nil to fail fast during wiring.
+func NewResumeUsecase(repo domain.ResumeRepository, cache domain.ContentCache) (ResumeUsecase, error) {
 	if repo == nil {
 		return nil, errors.New("usecase: resume repository must not be nil")
 	}
-	return &resumeUsecase{repo: repo}, nil
+	if cache == nil {
+		return nil, errors.New("usecase: resume cache must not be nil")
+	}
+	return &resumeUsecase{repo: repo, cache: cache}, nil
 }
 
 // Create persists a new resume. Setting IsActive makes it the active resume.
@@ -37,12 +41,22 @@ func (u *resumeUsecase) Create(ctx context.Context, res *domain.Resume) error {
 	if res == nil {
 		return errors.New("usecase: resume must not be nil")
 	}
-	return u.repo.Create(ctx, res)
+	if err := u.repo.Create(ctx, res); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceResumes)
+	return nil
 }
 
 // List retrieves one page of resumes.
 func (u *resumeUsecase) List(ctx context.Context, vis domain.Visibility, page domain.Page) ([]domain.Resume, error) {
-	return u.repo.List(ctx, vis, page.Normalize())
+	page = page.Normalize()
+	if vis != domain.VisibilityPublic {
+		return u.repo.List(ctx, vis, page) // admin reads are never cached
+	}
+	return cached(ctx, u.cache, domain.CacheNamespaceResumes, listKey(page), func(ctx context.Context) ([]domain.Resume, error) {
+		return u.repo.List(ctx, vis, page)
+	})
 }
 
 // GetByID retrieves a single resume. Returns domain.ErrNotFound (wrapped) when
@@ -51,7 +65,12 @@ func (u *resumeUsecase) GetByID(ctx context.Context, vis domain.Visibility, id s
 	if id == "" {
 		return nil, fmt.Errorf("usecase: invalid resume id %q", id)
 	}
-	return u.repo.GetByID(ctx, vis, id)
+	if vis != domain.VisibilityPublic {
+		return u.repo.GetByID(ctx, vis, id)
+	}
+	return cached(ctx, u.cache, domain.CacheNamespaceResumes, "id:"+id, func(ctx context.Context) (*domain.Resume, error) {
+		return u.repo.GetByID(ctx, vis, id)
+	})
 }
 
 // Update replaces the full representation of a resume. Setting IsActive makes
@@ -63,7 +82,11 @@ func (u *resumeUsecase) Update(ctx context.Context, res *domain.Resume) error {
 	if res.ID == "" {
 		return fmt.Errorf("usecase: invalid resume id %q", res.ID)
 	}
-	return u.repo.Update(ctx, res)
+	if err := u.repo.Update(ctx, res); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceResumes)
+	return nil
 }
 
 // Delete removes a resume by its identifier.
@@ -71,5 +94,9 @@ func (u *resumeUsecase) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("usecase: invalid resume id %q", id)
 	}
-	return u.repo.Delete(ctx, id)
+	if err := u.repo.Delete(ctx, id); err != nil {
+		return err
+	}
+	invalidate(ctx, u.cache, domain.CacheNamespaceResumes)
+	return nil
 }

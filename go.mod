@@ -8,6 +8,7 @@ require (
 	github.com/go-playground/validator/v10 v10.30.5
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
+	github.com/valkey-io/valkey-go v1.0.79
 	golang.org/x/oauth2 v0.27.0
 	golang.org/x/sync v0.23.0
 )

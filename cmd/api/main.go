@@ -22,6 +22,7 @@ import (
 	authmw "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/middleware"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/github"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/valkey"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/usecase"
 )
 
@@ -72,23 +73,34 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 	logger.Info("database connected", "app_env", cfg.appEnv)
 
-	// 2. Dependency injection: repository -> usecase -> handler.
-	projectUsecase, err := usecase.NewProjectUsecase(postgres.NewProjectRepository(pool))
+	// 2. Cache: in-process L1 in front of Valkey. Valkey is required at boot
+	// (fail fast, like the database); once running, an outage degrades reads
+	// to the database instead of failing them.
+	valkeyClient, err := valkey.Connect(cfg.valkeyAddr)
+	if err != nil {
+		return err
+	}
+	defer valkeyClient.Close()
+	contentCache := valkey.NewCache(valkeyClient, valkey.Config{})
+	logger.Info("valkey connected", "addr", cfg.valkeyAddr)
+
+	// 3. Dependency injection: repository -> usecase -> handler.
+	projectUsecase, err := usecase.NewProjectUsecase(postgres.NewProjectRepository(pool), contentCache)
 	if err != nil {
 		return fmt.Errorf("init project usecase: %w", err)
 	}
 
-	articleUsecase, err := usecase.NewArticleUsecase(postgres.NewArticleRepository(pool))
+	articleUsecase, err := usecase.NewArticleUsecase(postgres.NewArticleRepository(pool), contentCache)
 	if err != nil {
 		return fmt.Errorf("init article usecase: %w", err)
 	}
 
-	profileUsecase, err := usecase.NewProfileUsecase(postgres.NewProfileRepository(pool))
+	profileUsecase, err := usecase.NewProfileUsecase(postgres.NewProfileRepository(pool), contentCache)
 	if err != nil {
 		return fmt.Errorf("init profile usecase: %w", err)
 	}
 
-	resumeUsecase, err := usecase.NewResumeUsecase(postgres.NewResumeRepository(pool))
+	resumeUsecase, err := usecase.NewResumeUsecase(postgres.NewResumeRepository(pool), contentCache)
 	if err != nil {
 		return fmt.Errorf("init resume usecase: %w", err)
 	}
@@ -99,9 +111,10 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init auth usecase: %w", err)
 	}
 
-	// 3. Router and handlers.
+	// 4. Router and handlers.
 	router := newRouter(routerDeps{
 		db:              pool,
+		cache:           contentCache,
 		appEnv:          cfg.appEnv,
 		trustCloudflare: cfg.trustCloudflare,
 		projectHandler:  handler.NewProjectHandler(projectUsecase),
@@ -127,6 +140,7 @@ func connectDatabase(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // routerDeps carries everything newRouter needs to build the HTTP routes.
 type routerDeps struct {
 	db              pinger
+	cache           pinger // Valkey health; an outage degrades readiness, it does not fail it
 	appEnv          string
 	trustCloudflare bool
 	projectHandler  *handler.ProjectHandler
@@ -148,7 +162,7 @@ func newRouter(d routerDeps) http.Handler {
 		AllowedOrigins:   d.allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
-		ExposedHeaders:   []string{"Link"},
+		ExposedHeaders:   []string{"Link", authmw.CacheHeaderName},
 		AllowCredentials: true,
 		MaxAge:           300, // seconds a browser may cache the preflight result
 	}))
@@ -163,7 +177,7 @@ func newRouter(d routerDeps) http.Handler {
 
 	// Infrastructure routes.
 	r.Get("/healthz", handleHealthz)
-	r.Get("/readyz", handleReadyz(d.db))
+	r.Get("/readyz", handleReadyz(d.db, d.cache))
 
 	requireAdmin := authmw.RequireAdmin(d.authenticator, d.appEnv)
 	trustedOrigin := authmw.TrustedOrigin(d.allowedOrigins)
@@ -183,14 +197,19 @@ func newRouter(d routerDeps) http.Handler {
 
 		// Public reads: published articles and the active profile/resume only.
 		// Lists accept ?limit= (default 20, max 100) and ?offset=.
-		r.Get("/projects", d.projectHandler.List)
-		r.Get("/projects/{id}", d.projectHandler.GetByID)
-		r.Get("/articles", d.articleHandler.List)
-		r.Get("/articles/{id}", d.articleHandler.GetByID) // {id} is a UUID or a slug
-		r.Get("/profiles", d.profileHandler.List)
-		r.Get("/profiles/{id}", d.profileHandler.GetByID)
-		r.Get("/resumes", d.resumeHandler.List)
-		r.Get("/resumes/{id}", d.resumeHandler.GetByID)
+		// They are cache-aside reads and carry an X-Cache header.
+		r.Group(func(r chi.Router) {
+			r.Use(authmw.CacheStatus)
+
+			r.Get("/projects", d.projectHandler.List)
+			r.Get("/projects/{id}", d.projectHandler.GetByID)
+			r.Get("/articles", d.articleHandler.List)
+			r.Get("/articles/{id}", d.articleHandler.GetByID) // {id} is a UUID or a slug
+			r.Get("/profiles", d.profileHandler.List)
+			r.Get("/profiles/{id}", d.profileHandler.GetByID)
+			r.Get("/resumes", d.resumeHandler.List)
+			r.Get("/resumes/{id}", d.resumeHandler.GetByID)
+		})
 
 		// Admin-only: unfiltered reads and all mutations.
 		r.Group(func(r chi.Router) {
@@ -229,13 +248,23 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func handleReadyz(db pinger) http.HandlerFunc {
+// handleReadyz reports readiness. The database is mandatory: without it the
+// probe fails. Valkey is an optimisation, so when it is down the API stays
+// ready (reads fall back to PostgreSQL) and the body says the cache is degraded.
+func handleReadyz(db, cache pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyCheckTimeout)
 		defer cancel()
 
 		if err := db.Ping(ctx); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		if err := cache.Ping(ctx); err != nil {
+			slog.WarnContext(r.Context(), "readyz: valkey unreachable", "error", err)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready (cache degraded)"))
 			return
 		}
 
