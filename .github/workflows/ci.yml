@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_benchmark:
+        description: "Also run the k6 benchmark and publish it to /api/v1/benchmarks"
+        type: boolean
+        default: false
+      target_url:
+        description: "Base URL to load (default: repository variable BENCH_TARGET_URL)"
+        type: string
+        default: ""
+      peak_rps:
+        description: "Peak requests per second"
+        type: string
+        default: "5000"
+      hold:
+        description: "Time to hold the peak (k6 duration)"
+        type: string
+        default: "2m"
+  schedule:
+    - cron: "23 2 * * 0" # weekly benchmark, Sunday 02:23 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: gofmt, vet, race tests
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: portofolio_db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # Integration tests skip when these are unset; CI provides the real services.
+      DATABASE_URL: postgres://postgres:ci-only-password@127.0.0.1:5432/portofolio_db?sslmode=disable
+      VALKEY_ADDR: 127.0.0.1:6379
+      NATS_URL: nats://127.0.0.1:4222
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # nats-server needs the -js flag, which a services: container cannot pass.
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 nats:2.10-alpine -js
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null && exit 0
+            sleep 1
+          done
+          echo "NATS did not start" >&2
+          docker logs nats
+          exit 1
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  deploy-checks:
+    name: shell, manifests, images
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -s sh deploy/scripts/backup_postgres_azure.sh deploy/scripts/backup_postgres_azure_test.sh
+
+      - name: Backup script tests (stubbed Azure, real openssl)
+        run: sh deploy/scripts/backup_postgres_azure_test.sh
+
+      - name: Validate Kubernetes manifests
+        run: |
+          docker run --rm -v "$PWD/deploy/k8s:/k8s:ro" ghcr.io/yannh/kubeconform:latest \
+            -strict -summary /k8s
+
+      - name: Validate Grafana dashboard JSON
+        run: python3 -c "import json; json.load(open('deploy/grafana/portfolio-dashboard.json'))"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: api
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build migrate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: migrate
+          push: false
+
+      - name: Build backup image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/scripts/Dockerfile.backup
+          push: false
+
+  # Runs on a schedule or on demand (set "run_benchmark"). Results are published
+  # to POST /api/v1/benchmarks with the CI bearer token, even when the p99
+  # threshold is missed, and the job fails afterwards so a regression is visible.
+  #
+  # Use a target on the same LAN as the runner (a self-hosted runner on the
+  # Proxmox network) for meaningful numbers: loading 5,000 RPS through Cloudflare
+  # Tunnel from a hosted runner measures the internet and may trip Cloudflare limits.
+  benchmark:
+    name: k6 benchmark
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_benchmark)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET_URL: ${{ inputs.target_url || vars.BENCH_TARGET_URL }}
+      PUBLISH_URL: ${{ vars.BENCH_PUBLISH_URL || inputs.target_url || vars.BENCH_TARGET_URL }}
+      PEAK_RPS: ${{ inputs.peak_rps || '5000' }}
+      HOLD: ${{ inputs.hold || '2m' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        env:
+          CI_BENCHMARK_TOKEN: ${{ secrets.CI_BENCHMARK_TOKEN }}
+        run: |
+          [ -n "$TARGET_URL" ] || { echo "Set the BENCH_TARGET_URL repository variable or the target_url input." >&2; exit 1; }
+          [ -n "$CI_BENCHMARK_TOKEN" ] || { echo "Set the CI_BENCHMARK_TOKEN repository secret." >&2; exit 1; }
+
+      - uses: grafana/setup-k6-action@v1
+
+      - name: Run k6
+        id: k6
+        run: |
+          set +e
+          k6 run --summary-export k6-summary.json \
+            -e BASE_URL="$TARGET_URL" -e PEAK_RPS="$PEAK_RPS" -e HOLD="$HOLD" \
+            loadtest/f1_read_p99.js
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          test -s k6-summary.json
+
+      - name: Publish result to /api/v1/benchmarks
+        env:
+          CI_BENCHMARK_TOKEN: ${{ secrets.CI_BENCHMARK_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          # k6 exports trend stats either flat or under .values depending on its version.
+          jq -n --slurpfile s k6-summary.json             --arg sha "$COMMIT_SHA" --arg branch "$BRANCH" --argjson target "$PEAK_RPS" '
+            def v: (.values // .);
+            $s[0].metrics as $m
+            | ($m.http_req_duration | v) as $d
+            | {
+                commit_sha: $sha,
+                branch: $branch,
+                scenario: "f1_read_p99",
+                target_rps: $target,
+                achieved_rps: (($m.http_reqs | v).rate // 0),
+                p50_ms: ($d.med // $d["p(50)"] // 0),
+                p95_ms: ($d["p(95)"] // 0),
+                p99_ms: ($d["p(99)"] // 0),
+                error_rate: (($m.http_req_failed | v).value // ($m.http_req_failed | v).rate // 0),
+                raw_summary: $s[0]
+              }' > payload.json
+
+          # The token goes through a header file so it never shows in the process list or logs.
+          printf 'Authorization: Bearer %s\n' "$CI_BENCHMARK_TOKEN" > auth.header
+          status=$(curl --silent --show-error --output response.json --write-out '%{http_code}' \
+            --request POST --header @auth.header --header 'Content-Type: application/json' \
+            --data @payload.json "${PUBLISH_URL%/}/api/v1/benchmarks")
+          rm -f auth.header
+          echo "POST /api/v1/benchmarks -> HTTP $status"
+          [ "$status" = 201 ] || { cat response.json >&2; exit 1; }
+          jq '{commit_sha, p50_ms, p95_ms, p99_ms, achieved_rps, error_rate}' payload.json
+
+      - name: Fail when k6 thresholds were missed
+        if: steps.k6.outputs.exit_code != '0'
+        run: |
+          echo "k6 exited with ${{ steps.k6.outputs.exit_code }}: a threshold (p99 < 50 ms, failures < 0.1 %) was missed." >&2
+          exit 1

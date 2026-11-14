@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+# Encrypted PostgreSQL backup to Azure Blob (k8s CronJob deploy/k8s/backup-cronjob.yaml).
+# Build from the repository root:
+#   docker build -f deploy/scripts/Dockerfile.backup -t portfolio-backup:latest .
+# pg_dump/pg_restore 17 come from the postgres image so they match the server version.
+FROM postgres:17-alpine
+RUN apk add --no-cache openssl curl ca-certificates
+COPY deploy/scripts/backup_postgres_azure.sh /usr/local/bin/backup_postgres_azure.sh
+RUN chmod 0555 /usr/local/bin/backup_postgres_azure.sh
+USER 70:70
+ENTRYPOINT ["/usr/local/bin/backup_postgres_azure.sh"]
