@@ -30,13 +30,21 @@ const (
 
 // Client owns the NATS connection and the JetStream handle.
 type Client struct {
-	nc *nats.Conn
-	js jetstream.JetStream
+	nc      *nats.Conn
+	js      jetstream.JetStream
+	stream  string
+	subject string
 }
 
 // Connect dials NATS and makes sure the events stream exists. It fails fast so
 // the process never starts without a broker.
 func Connect(ctx context.Context, url string) (*Client, error) {
+	return ConnectStream(ctx, url, domain.EventStreamName, domain.EventSubject)
+}
+
+// ConnectStream is Connect with an explicit stream and subject. Tests use it
+// to get a private stream that cannot collide with a running worker.
+func ConnectStream(ctx context.Context, url, stream, subject string) (*Client, error) {
 	nc, err := nats.Connect(url,
 		nats.Name("portfolio-api"),
 		nats.Timeout(connectTimeout),
@@ -53,7 +61,7 @@ func Connect(ctx context.Context, url string) (*Client, error) {
 		return nil, fmt.Errorf("init jetstream: %w", err)
 	}
 
-	c := &Client{nc: nc, js: js}
+	c := &Client{nc: nc, js: js, stream: stream, subject: subject}
 	if err := c.ensureStream(ctx); err != nil {
 		nc.Close()
 		return nil, err
@@ -70,8 +78,8 @@ func (c *Client) ensureStream(ctx context.Context) error {
 	defer cancel()
 
 	_, err := c.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:       domain.EventStreamName,
-		Subjects:   []string{domain.EventSubject},
+		Name:       c.stream,
+		Subjects:   []string{c.subject},
 		Retention:  jetstream.WorkQueuePolicy,
 		Discard:    jetstream.DiscardNew,
 		Storage:    jetstream.FileStorage,
@@ -81,7 +89,7 @@ func (c *Client) ensureStream(ctx context.Context) error {
 		Duplicates: streamDedupWindow,
 	})
 	if err != nil {
-		return fmt.Errorf("ensure stream %s: %w", domain.EventStreamName, err)
+		return fmt.Errorf("ensure stream %s: %w", c.stream, err)
 	}
 	return nil
 }
@@ -101,6 +109,11 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("nats flush: %w", err)
 	}
 	return nil
+}
+
+// DeleteStream removes the stream and every message in it. It exists for tests.
+func (c *Client) DeleteStream(ctx context.Context) error {
+	return c.js.DeleteStream(ctx, c.stream)
 }
 
 // Drain stops accepting new work, flushes pending messages and closes the

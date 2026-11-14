@@ -40,3 +40,32 @@ type EventPublisher interface {
 	// Ping reports whether the bus is reachable.
 	Ping(ctx context.Context) error
 }
+
+// EventRepository persists events and their per-minute rollups.
+type EventRepository interface {
+	// InsertBatch stores the events and updates the per-minute aggregates in
+	// one atomic statement. It is idempotent per EventID: an event that is
+	// already stored is skipped and never counted again. It returns how many
+	// events were newly stored.
+	InsertBatch(ctx context.Context, events []Event) (inserted int, err error)
+}
+
+// EventDelivery is one event taken from the bus, with the means to settle it.
+type EventDelivery struct {
+	Event Event
+	// Attempt is the 1-based delivery attempt of this message.
+	Attempt int
+	// Ack removes the message from the bus. Nak asks for redelivery after a
+	// delay. Term stops redelivery for good (poison messages).
+	Ack  func() error
+	Nak  func() error
+	Term func() error
+}
+
+// EventSource pulls batches of events from the bus.
+type EventSource interface {
+	// Fetch returns up to max deliveries, waiting at most wait for them. An
+	// empty result without an error means nothing arrived in time. Messages
+	// that cannot be decoded are terminated by the source and never returned.
+	Fetch(ctx context.Context, max int, wait time.Duration) ([]EventDelivery, error)
+}

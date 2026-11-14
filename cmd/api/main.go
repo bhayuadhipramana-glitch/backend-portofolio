@@ -26,6 +26,7 @@ import (
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/valkey"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/usecase"
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/worker"
 )
 
 const (
@@ -150,7 +151,35 @@ func run(logger *slog.Logger) error {
 		allowedOrigins:  cfg.allowedOrigin,
 	})
 
-	return serve(ctx, logger, newServer(router, cfg.port))
+	// 6. F4 aggregation worker, running alongside the HTTP server.
+	eventSource, err := natsClient.NewEventSource(ctx)
+	if err != nil {
+		return err
+	}
+	aggregator, err := worker.NewAggregator(eventSource, postgres.NewEventRepository(pool), logger)
+	if err != nil {
+		return fmt.Errorf("init aggregation worker: %w", err)
+	}
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		_ = aggregator.Run(ctx) // Run only returns once ctx is cancelled
+	}()
+
+	serveErr := serve(ctx, logger, newServer(router, cfg.port))
+
+	// Shutdown order: stop the HTTP server (done), let the worker finish its
+	// in-flight batch, then drain NATS; the deferred pool.Close runs last.
+	stop()
+	select {
+	case <-workerDone:
+	case <-time.After(shutdownTimeout):
+		logger.Warn("aggregation worker did not stop in time")
+	}
+	if err := natsClient.Drain(); err != nil {
+		logger.Warn("nats drain failed", "error", err)
+	}
+	return serveErr
 }
 
 func connectDatabase(ctx context.Context, dsn string) (*pgxpool.Pool, error) {

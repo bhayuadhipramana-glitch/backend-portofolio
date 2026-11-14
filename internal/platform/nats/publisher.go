@@ -39,7 +39,7 @@ func (p *Publisher) Publish(ctx context.Context, events []domain.Event) error {
 			return fmt.Errorf("marshal event %s: %w", ev.EventID, err)
 		}
 		msg := &nats.Msg{
-			Subject: domain.EventSubject,
+			Subject: p.client.subject,
 			Data:    body,
 			Header:  nats.Header{},
 		}

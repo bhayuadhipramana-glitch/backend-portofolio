@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go/jetstream"
-
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/domain"
 )
 
@@ -63,23 +61,26 @@ func TestConnectEnsuresBoundedStream(t *testing.T) {
 }
 
 func TestPublishDeduplicatesByEventID(t *testing.T) {
-	c := newTestClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	url := os.Getenv("NATS_URL")
+	if url == "" {
+		url = "nats://127.0.0.1:4222"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// A private stream keeps this test away from a running worker.
+	suffix := newUUID(t)[:8]
+	c, err := ConnectStream(ctx, url, "TEST_DEDUPE_"+suffix, "test.dedupe."+suffix)
+	if err != nil {
+		t.Skipf("NATS not reachable at %s: %v", url, err)
+	}
+	defer c.Close()
+	defer func() { _ = c.DeleteStream(context.Background()) }()
 
 	pub := NewPublisher(c)
 	ev := domain.Event{
 		EventID: newUUID(t), EventType: "dedupe_test", Source: "test",
 		LatencyMS: 1, OccurredAt: time.Now().UTC(),
-	}
-
-	stream, err := c.js.Stream(ctx, domain.EventStreamName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before, err := stream.Info(ctx)
-	if err != nil {
-		t.Fatal(err)
 	}
 
 	// Same event_id twice in one batch and again in a retry.
@@ -90,19 +91,15 @@ func TestPublishDeduplicatesByEventID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Remove the test message so a running worker never aggregates it.
-	t.Cleanup(func() {
-		raw, err := stream.GetLastMsgForSubject(context.Background(), domain.EventSubject)
-		if err == nil && raw.Header.Get(jetstream.MsgIDHeader) == ev.EventID {
-			_ = stream.DeleteMsg(context.Background(), raw.Sequence)
-		}
-	})
-
-	after, err := stream.Info(ctx)
+	stream, err := c.js.Stream(ctx, c.stream)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := after.State.Msgs - before.State.Msgs; got != 1 {
-		t.Fatalf("stream grew by %d messages, want 1 (Nats-Msg-Id dedup)", got)
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != 1 {
+		t.Fatalf("stream holds %d messages, want 1 (Nats-Msg-Id dedup)", info.State.Msgs)
 	}
 }
