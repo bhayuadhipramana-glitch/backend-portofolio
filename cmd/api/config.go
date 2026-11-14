@@ -29,6 +29,9 @@ const (
 
 	// minCIBenchmarkTokenLen rejects guessable CI tokens at startup.
 	minCIBenchmarkTokenLen = 32
+
+	// minMetricsTokenLen rejects guessable /metrics tokens at startup.
+	minMetricsTokenLen = 32
 )
 
 // config holds every setting read from the environment.
@@ -52,6 +55,9 @@ type config struct {
 
 	contactWebhookURL string // optional: F9 outbox delivers contact notifications here; empty means log-only
 	ciBenchmarkToken  string // optional: bearer token CI uses to publish F8 benchmarks; empty disables it
+
+	otlpEndpoint string // optional: OTLP/HTTP collector for traces; empty means no trace export
+	metricsToken string // optional: bearer token for GET /metrics; empty restricts it to internal peers
 }
 
 // loadConfig reads and validates the environment. It fails fast when a
@@ -68,6 +74,8 @@ type config struct {
 //	AUTH_SUCCESS_URL         where to redirect after a successful login (default: JSON response)
 //	CONTACT_WEBHOOK_URL      optional http(s) URL that receives contact notifications (default: log only)
 //	CI_BENCHMARK_TOKEN       optional bearer token for CI to POST /api/v1/benchmarks (min 32 characters)
+//	OTEL_EXPORTER_OTLP_ENDPOINT  optional OTLP/HTTP collector URL for traces (default: no trace export)
+//	METRICS_TOKEN            optional bearer token for GET /metrics (min 32 characters; default: internal peers only)
 func loadConfig() (config, error) {
 	cfg := config{
 		appEnv:          strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))),
@@ -83,6 +91,9 @@ func loadConfig() (config, error) {
 
 		contactWebhookURL: strings.TrimSpace(os.Getenv("CONTACT_WEBHOOK_URL")),
 		ciBenchmarkToken:  strings.TrimSpace(os.Getenv("CI_BENCHMARK_TOKEN")),
+
+		otlpEndpoint: strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
+		metricsToken: strings.TrimSpace(os.Getenv("METRICS_TOKEN")),
 	}
 	if cfg.appEnv == "" {
 		cfg.appEnv = envLocal
@@ -124,6 +135,16 @@ func loadConfig() (config, error) {
 	}
 	if cfg.ciBenchmarkToken != "" && len(cfg.ciBenchmarkToken) < minCIBenchmarkTokenLen {
 		return config{}, fmt.Errorf("environment variable CI_BENCHMARK_TOKEN must be at least %d characters", minCIBenchmarkTokenLen)
+	}
+
+	if cfg.metricsToken != "" && len(cfg.metricsToken) < minMetricsTokenLen {
+		return config{}, fmt.Errorf("environment variable METRICS_TOKEN must be at least %d characters", minMetricsTokenLen)
+	}
+	if cfg.otlpEndpoint != "" {
+		u, err := url.Parse(cfg.otlpEndpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return config{}, errors.New("environment variable OTEL_EXPORTER_OTLP_ENDPOINT must be an absolute http(s) URL")
+		}
 	}
 
 	origins := os.Getenv("CORS_ALLOWED_ORIGINS")

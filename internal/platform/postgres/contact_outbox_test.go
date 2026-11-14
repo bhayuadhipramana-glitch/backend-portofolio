@@ -256,3 +256,31 @@ func TestOutboxDispatchSkipsLockedRows(t *testing.T) {
 		t.Fatalf("worker A handled %d, want 2", got)
 	}
 }
+
+func TestOutboxPendingCountExcludesSent(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	contacts := NewContactRepository(pool)
+	repo := NewOutboxRepository(pool)
+
+	if n, err := repo.PendingCount(ctx); err != nil || n != 0 {
+		t.Fatalf("empty outbox: count %d, err %v", n, err)
+	}
+	for _, id := range []string{"1", "2"} {
+		if err := contacts.CreateWithOutbox(ctx, testContact(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := repo.PendingCount(ctx); err != nil || n != 2 {
+		t.Fatalf("two pending: count %d, err %v", n, err)
+	}
+
+	// Deliver both: sent rows no longer count.
+	ok := func(context.Context, domain.OutboxMessage) error { return nil }
+	if _, err := repo.Dispatch(ctx, 10, 5, noBackoff, ok); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := repo.PendingCount(ctx); err != nil || n != 0 {
+		t.Fatalf("after delivery: count %d, err %v", n, err)
+	}
+}

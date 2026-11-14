@@ -23,6 +23,7 @@ import (
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/domain"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/handler"
 	authmw "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/middleware"
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/observability"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/github"
 	natsbus "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/nats"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/notify"
@@ -88,6 +89,19 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// 0. F6 observability: metrics are always on; traces only with an OTLP endpoint.
+	obs, err := observability.New(ctx, observability.Config{OTLPEndpoint: cfg.otlpEndpoint})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := obs.Shutdown(sctx); err != nil {
+			logger.Warn("observability shutdown failed", "error", err)
+		}
+	}()
+
 	// 1. Database connection.
 	pool, err := connectDatabase(ctx, cfg.databaseURL)
 	if err != nil {
@@ -104,7 +118,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer valkeyClient.Close()
-	contentCache := valkey.NewCache(valkeyClient, valkey.Config{})
+	contentCache := obs.InstrumentCache(valkey.NewCache(valkeyClient, valkey.Config{}))
 	logger.Info("valkey connected", "addr", cfg.valkeyAddr)
 
 	// 3. Event bus: NATS JetStream is required at boot for F3 ingest; once
@@ -143,7 +157,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init auth usecase: %w", err)
 	}
 
-	eventUsecase, err := usecase.NewEventUsecase(natsbus.NewPublisher(natsClient))
+	eventUsecase, err := usecase.NewEventUsecase(obs.InstrumentPublisher(natsbus.NewPublisher(natsClient)))
 	if err != nil {
 		return fmt.Errorf("init event usecase: %w", err)
 	}
@@ -170,6 +184,15 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init benchmark usecase: %w", err)
 	}
 
+	streamLimiter := authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)
+	outboxRepo := postgres.NewOutboxRepository(pool)
+	if err := obs.ObserveActiveSSE(streamLimiter.Active); err != nil {
+		return fmt.Errorf("init sse gauge: %w", err)
+	}
+	if err := obs.ObserveOutboxPending(outboxRepo.PendingCount); err != nil {
+		return fmt.Errorf("init outbox gauge: %w", err)
+	}
+
 	// 5. Router and handlers.
 	router := newRouter(routerDeps{
 		db:               pool,
@@ -188,11 +211,13 @@ func run(logger *slog.Logger) error {
 		contactLimiter:   authmw.NewWindowLimiter(contactPerIP, contactWindow).Middleware,
 		benchmarkHandler: handler.NewBenchmarkHandler(benchmarkUsecase),
 		benchmarkToken:   cfg.ciBenchmarkToken,
-		streamHandler:    handler.NewStreamHandler(liveStatsUsecase, authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)),
+		streamHandler:    handler.NewStreamHandler(liveStatsUsecase, streamLimiter),
 		eventLimiter:     authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
 		authHandler:      handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
 		authenticator:    authUsecase,
 		allowedOrigins:   cfg.allowedOrigin,
+		httpMetrics:      obs.HTTP,
+		metricsHandler:   observability.MetricsAccess(cfg.metricsToken)(obs.Handler()),
 	})
 
 	// 6. F4 aggregation worker, running alongside the HTTP server.
@@ -200,7 +225,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	aggregator, err := worker.NewAggregator(eventSource, postgres.NewEventRepository(pool), logger)
+	aggregator, err := worker.NewAggregator(obs.InstrumentSource(eventSource), postgres.NewEventRepository(pool), logger)
 	if err != nil {
 		return fmt.Errorf("init aggregation worker: %w", err)
 	}
@@ -215,7 +240,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	dispatcher, err := worker.NewOutboxDispatcher(postgres.NewOutboxRepository(pool), notifier, logger)
+	dispatcher, err := worker.NewOutboxDispatcher(obs.InstrumentOutbox(outboxRepo), notifier, logger)
 	if err != nil {
 		return fmt.Errorf("init outbox dispatcher: %w", err)
 	}
@@ -282,6 +307,8 @@ type routerDeps struct {
 	authHandler      *handler.AuthHandler
 	authenticator    authmw.Authenticator
 	allowedOrigins   []string
+	httpMetrics      func(http.Handler) http.Handler // F6 request metrics; nil disables them
+	metricsHandler   http.Handler                    // F6 GET /metrics, already access-guarded; nil disables it
 }
 
 func newRouter(d routerDeps) http.Handler {
@@ -303,6 +330,9 @@ func newRouter(d routerDeps) http.Handler {
 	// trusts CF-Connecting-IP, and only when running behind Cloudflare Tunnel.
 	root.Use(middleware.RequestID)
 	root.Use(authmw.ClientIP(d.trustCloudflare))
+	if d.httpMetrics != nil {
+		root.Use(d.httpMetrics)
+	}
 	root.Use(middleware.Logger)
 	root.Use(middleware.Recoverer)
 
@@ -320,6 +350,9 @@ func newRouter(d routerDeps) http.Handler {
 	// Infrastructure routes.
 	r.Get("/healthz", handleHealthz)
 	r.Get("/readyz", handleReadyz(d.db, d.cache, d.bus))
+	if d.metricsHandler != nil {
+		r.Method(http.MethodGet, "/metrics", d.metricsHandler)
+	}
 
 	requireAdmin := authmw.RequireAdmin(d.authenticator, d.appEnv)
 	trustedOrigin := authmw.TrustedOrigin(d.allowedOrigins)

@@ -100,3 +100,15 @@ func (r *OutboxRepository) Dispatch(
 	}
 	return len(msgs), nil
 }
+
+const pendingOutboxSQL = `SELECT COUNT(*) FROM outbox WHERE status IN ('pending', 'failed')`
+
+// PendingCount returns how many messages still wait for delivery (pending or
+// failed). It feeds the outbox backlog gauge; dead and sent rows are excluded.
+func (r *OutboxRepository) PendingCount(ctx context.Context) (int64, error) {
+	var n int64
+	if err := r.pool.QueryRow(ctx, pendingOutboxSQL).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count pending outbox: %w", err)
+	}
+	return n, nil
+}

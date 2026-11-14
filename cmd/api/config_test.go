@@ -58,3 +58,49 @@ func TestLoadConfigRejectsBadF8F9Settings(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfigF6ObservabilitySettings(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("METRICS_TOKEN", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unset observability settings must be accepted: %v", err)
+	}
+	if cfg.metricsToken != "" || cfg.otlpEndpoint != "" {
+		t.Fatalf("defaults should be empty, got %q / %q", cfg.metricsToken, cfg.otlpEndpoint)
+	}
+
+	t.Setenv("METRICS_TOKEN", " "+strings.Repeat("m", 32)+" ")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", " http://otel-collector:4318 ")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.metricsToken) != 32 || cfg.otlpEndpoint != "http://otel-collector:4318" {
+		t.Fatalf("settings not loaded: %d chars / %q", len(cfg.metricsToken), cfg.otlpEndpoint)
+	}
+}
+
+func TestLoadConfigRejectsBadF6Settings(t *testing.T) {
+	tests := []struct{ name, key, value string }{
+		{"short metrics token", "METRICS_TOKEN", "short"},
+		{"endpoint not a URL", "OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4318"},
+		{"endpoint wrong scheme", "OTEL_EXPORTER_OTLP_ENDPOINT", "grpc://collector:4317"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("METRICS_TOKEN", "")
+			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+			t.Setenv(tt.key, tt.value)
+			_, err := loadConfig()
+			if err == nil || !strings.Contains(err.Error(), tt.key) {
+				t.Fatalf("err = %v, want it to name %s", err, tt.key)
+			}
+			if strings.Contains(err.Error(), tt.value) {
+				t.Fatalf("error leaks the configured value: %v", err)
+			}
+		})
+	}
+}
