@@ -20,7 +20,13 @@ const maxBodyBytes = 1 << 20
 // value is an error. On failure it writes the error response (413 for an
 // oversized body, 400 otherwise) and returns false.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	return decodeJSONLimit(w, r, dst, maxBodyBytes)
+}
+
+// decodeJSONLimit is decodeJSON with an explicit body cap, for endpoints that
+// need a tighter limit than the default (such as F3 event batches).
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

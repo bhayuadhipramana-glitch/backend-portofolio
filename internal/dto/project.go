@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 )
@@ -47,6 +48,15 @@ func getValidator() *validator.Validate {
 		})
 		_ = validate.RegisterValidation("slug", func(fl validator.FieldLevel) bool {
 			return slugPattern.MatchString(fl.Field().String())
+		})
+		// notblank rejects strings that are empty after trimming whitespace.
+		_ = validate.RegisterValidation("notblank", func(fl validator.FieldLevel) bool {
+			return strings.TrimSpace(fl.Field().String()) != ""
+		})
+		// rfc3339 accepts a timestamp such as 2026-01-02T15:04:05Z or with an offset.
+		_ = validate.RegisterValidation("rfc3339", func(fl validator.FieldLevel) bool {
+			_, err := time.Parse(time.RFC3339, fl.Field().String())
+			return err == nil
 		})
 		// jsonobject accepts a json.RawMessage holding a syntactically valid JSON object.
 		_ = validate.RegisterValidation("jsonobject", func(fl validator.FieldLevel) bool {
@@ -130,6 +140,14 @@ func msgForTag(fe validator.FieldError) string {
 		return fmt.Sprintf("%s must be lowercase letters, digits and single hyphens", jsonFieldName(fe.Field()))
 	case "jsonobject":
 		return fmt.Sprintf("%s must be a valid JSON object", jsonFieldName(fe.Field()))
+	case "notblank":
+		return fmt.Sprintf("%s must not be blank", jsonFieldName(fe.Field()))
+	case "uuid":
+		return fmt.Sprintf("%s must be a valid UUID", jsonFieldName(fe.Field()))
+	case "rfc3339":
+		return fmt.Sprintf("%s must be an RFC 3339 timestamp", jsonFieldName(fe.Field()))
+	case "gte":
+		return fmt.Sprintf("%s must be at least %s", jsonFieldName(fe.Field()), fe.Param())
 	case "oneof":
 		return fmt.Sprintf("%s must be one of: %s", jsonFieldName(fe.Field()), fe.Param())
 	case "min":

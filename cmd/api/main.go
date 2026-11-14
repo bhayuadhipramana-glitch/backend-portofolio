@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/handler"
 	authmw "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/middleware"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/github"
+	natsbus "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/nats"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/valkey"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/usecase"
@@ -31,8 +33,13 @@ const (
 	readTimeout       = 10 * time.Second
 	// writeTimeout must stay above requestTimeout so a handler that hits its
 	// deadline can still write the 503 response before the connection closes.
-	writeTimeout      = 30 * time.Second
-	requestTimeout    = 25 * time.Second
+	writeTimeout   = 30 * time.Second
+	requestTimeout = 25 * time.Second
+	// Per-IP budget for POST /api/v1/events: each request may carry up to 100
+	// events, so this allows a sustained 1,000 events/s per client.
+	eventRatePerSecond = 10
+	eventBurst         = 20
+
 	idleTimeout       = 60 * time.Second
 	shutdownTimeout   = 15 * time.Second
 	readyCheckTimeout = 2 * time.Second
@@ -84,7 +91,16 @@ func run(logger *slog.Logger) error {
 	contentCache := valkey.NewCache(valkeyClient, valkey.Config{})
 	logger.Info("valkey connected", "addr", cfg.valkeyAddr)
 
-	// 3. Dependency injection: repository -> usecase -> handler.
+	// 3. Event bus: NATS JetStream is required at boot for F3 ingest; once
+	// running, an outage makes ingest answer 503 and degrades /readyz.
+	natsClient, err := natsbus.Connect(ctx, cfg.natsURL)
+	if err != nil {
+		return err
+	}
+	defer natsClient.Close()
+	logger.Info("nats connected", "url", cfg.natsURL)
+
+	// 4. Dependency injection: repository -> usecase -> handler.
 	projectUsecase, err := usecase.NewProjectUsecase(postgres.NewProjectRepository(pool), contentCache)
 	if err != nil {
 		return fmt.Errorf("init project usecase: %w", err)
@@ -111,16 +127,24 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init auth usecase: %w", err)
 	}
 
-	// 4. Router and handlers.
+	eventUsecase, err := usecase.NewEventUsecase(natsbus.NewPublisher(natsClient))
+	if err != nil {
+		return fmt.Errorf("init event usecase: %w", err)
+	}
+
+	// 5. Router and handlers.
 	router := newRouter(routerDeps{
 		db:              pool,
 		cache:           contentCache,
+		bus:             natsClient,
 		appEnv:          cfg.appEnv,
 		trustCloudflare: cfg.trustCloudflare,
 		projectHandler:  handler.NewProjectHandler(projectUsecase),
 		articleHandler:  handler.NewArticleHandler(articleUsecase),
 		profileHandler:  handler.NewProfileHandler(profileUsecase),
 		resumeHandler:   handler.NewResumeHandler(resumeUsecase),
+		eventHandler:    handler.NewEventHandler(eventUsecase),
+		eventLimiter:    authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
 		authHandler:     handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
 		authenticator:   authUsecase,
 		allowedOrigins:  cfg.allowedOrigin,
@@ -141,12 +165,15 @@ func connectDatabase(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 type routerDeps struct {
 	db              pinger
 	cache           pinger // Valkey health; an outage degrades readiness, it does not fail it
+	bus             pinger // NATS health; an outage degrades readiness, it does not fail it
 	appEnv          string
 	trustCloudflare bool
 	projectHandler  *handler.ProjectHandler
 	articleHandler  *handler.ArticleHandler
 	profileHandler  *handler.ProfileHandler
 	resumeHandler   *handler.ResumeHandler
+	eventHandler    *handler.EventHandler
+	eventLimiter    func(http.Handler) http.Handler // per-IP rate limit for event ingest
 	authHandler     *handler.AuthHandler
 	authenticator   authmw.Authenticator
 	allowedOrigins  []string
@@ -177,7 +204,7 @@ func newRouter(d routerDeps) http.Handler {
 
 	// Infrastructure routes.
 	r.Get("/healthz", handleHealthz)
-	r.Get("/readyz", handleReadyz(d.db, d.cache))
+	r.Get("/readyz", handleReadyz(d.db, d.cache, d.bus))
 
 	requireAdmin := authmw.RequireAdmin(d.authenticator, d.appEnv)
 	trustedOrigin := authmw.TrustedOrigin(d.allowedOrigins)
@@ -210,6 +237,17 @@ func newRouter(d routerDeps) http.Handler {
 			r.Get("/resumes", d.resumeHandler.List)
 			r.Get("/resumes/{id}", d.resumeHandler.GetByID)
 		})
+
+		// F3 public event ingest: per-IP rate limited, body and batch bounded,
+		// published to JetStream and aggregated asynchronously by the worker.
+		if d.eventHandler != nil {
+			r.Group(func(r chi.Router) {
+				if d.eventLimiter != nil {
+					r.Use(d.eventLimiter)
+				}
+				r.Post("/events", d.eventHandler.Ingest)
+			})
+		}
 
 		// Admin-only: unfiltered reads and all mutations.
 		r.Group(func(r chi.Router) {
@@ -249,9 +287,10 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleReadyz reports readiness. The database is mandatory: without it the
-// probe fails. Valkey is an optimisation, so when it is down the API stays
-// ready (reads fall back to PostgreSQL) and the body says the cache is degraded.
-func handleReadyz(db, cache pinger) http.HandlerFunc {
+// probe fails. Valkey and NATS are not: when Valkey is down reads fall back to
+// PostgreSQL, and when NATS is down only event ingest fails (503), so the API
+// stays ready and the body names what is degraded. A nil pinger is skipped.
+func handleReadyz(db, cache, bus pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyCheckTimeout)
 		defer cancel()
@@ -261,14 +300,25 @@ func handleReadyz(db, cache pinger) http.HandlerFunc {
 			return
 		}
 
-		if err := cache.Ping(ctx); err != nil {
-			slog.WarnContext(r.Context(), "readyz: valkey unreachable", "error", err)
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ready (cache degraded)"))
-			return
+		var degraded []string
+		if cache != nil {
+			if err := cache.Ping(ctx); err != nil {
+				slog.WarnContext(r.Context(), "readyz: valkey unreachable", "error", err)
+				degraded = append(degraded, "cache")
+			}
+		}
+		if bus != nil {
+			if err := bus.Ping(ctx); err != nil {
+				slog.WarnContext(r.Context(), "readyz: nats unreachable", "error", err)
+				degraded = append(degraded, "events")
+			}
 		}
 
 		w.WriteHeader(http.StatusOK)
+		if len(degraded) > 0 {
+			_, _ = w.Write([]byte("ready (" + strings.Join(degraded, ", ") + " degraded)"))
+			return
+		}
 		_, _ = w.Write([]byte("ready"))
 	}
 }
