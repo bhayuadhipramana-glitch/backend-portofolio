@@ -13,9 +13,11 @@ import (
 const (
 	// BatchSize is how many events one fetch asks for.
 	BatchSize = domain.MaxEventBatch
-	// fetchWait is how long one fetch waits for messages. It also bounds how
-	// long shutdown waits for an idle worker to notice the cancellation.
-	fetchWait = 2 * time.Second
+	// fetchWait is how long one pull request waits to fill a batch. JetStream
+	// answers a pull only when the batch is full or this wait expires, so it is
+	// also the worst-case added latency of an event; keep it well under the
+	// 2 s end-to-end goal (PRD G2). It also bounds shutdown latency.
+	fetchWait = 250 * time.Millisecond
 	// writeTimeout bounds one database write.
 	writeTimeout = 10 * time.Second
 	// backoffMin and backoffMax bound the pause after repeated failures.

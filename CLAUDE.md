@@ -49,6 +49,13 @@ Reads that differ between visitors and the admin take a `domain.Visibility`; the
 - `nats-server` has no CLI flags for store limits; they live in `deploy/nats/nats-server.conf` (64 MB memory, 256 MB file). Tests use a private stream via `natsbus.ConnectStream`, never `PORTFOLIO_EVENTS`.
 - Integration tests need `docker compose up -d nats postgres` and `DATABASE_URL`; they skip when the service is unreachable.
 
+## Live Feed (F5 SSE)
+- `GET /api/v1/events/stream` (`handler.StreamHandler`) pushes an `event: snapshot` frame every 1 s: 15 gap-free per-minute buckets from `event_aggregates` plus rolling RPS, error rate and avg/max latency (`domain.LiveSnapshot`). Frames are shared by all clients through `usecase.LiveStatsUsecase` (250 ms cache), so 100 viewers cost about 4 queries/s; the worker pull wait is 250 ms, keeping event-to-stream latency under the 2 s goal (about 1 s observed, 1.5 s worst case: 1 s tick + 250 ms pull + 250 ms cache).
+- **Timeout override:** the route is registered on the root router in `newRouter`, before `middleware.Timeout(25s)` is attached with `root.With(...)`. Any new long-lived route must do the same, and must call `http.NewResponseController(w).SetWriteDeadline(time.Time{})` itself, because the server `WriteTimeout` (30 s) is not per-route. Never wrap the stream in a middleware that buffers or hides `http.Flusher`/`Unwrap`.
+- Send `: ping` every 15 s (Cloudflare Tunnel drops idle connections) and set `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`. A stream ends after 30 min; `EventSource` reconnects (`retry: 3000`).
+- **Concurrency caps** (`middleware.ConnLimiter`, never blocking): 100 streams globally (`503` + `Retry-After`), 3 per client IP (`429`). Release the slot with `defer` the moment the handler returns.
+- Snapshot errors are logged and skipped; they never reach the client.
+
 ## Database & Migration Rules (PostgreSQL 17)
 - Single source of truth for schema: `migrations/` (`000001_name.up.sql` and `.down.sql`). Do NOT create `db/migrations/`.
 - Always use parameterized queries (`$1`, `$2`). Never concatenate user input into SQL strings.

@@ -41,6 +41,10 @@ const (
 	eventRatePerSecond = 10
 	eventBurst         = 20
 
+	// SSE guardrails: total concurrent live-feed clients and the share per IP.
+	maxStreamClients = 100
+	maxStreamsPerIP  = 3
+
 	idleTimeout       = 60 * time.Second
 	shutdownTimeout   = 15 * time.Second
 	readyCheckTimeout = 2 * time.Second
@@ -133,6 +137,11 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init event usecase: %w", err)
 	}
 
+	liveStatsUsecase, err := usecase.NewLiveStatsUsecase(postgres.NewEventStatsRepository(pool))
+	if err != nil {
+		return fmt.Errorf("init live stats usecase: %w", err)
+	}
+
 	// 5. Router and handlers.
 	router := newRouter(routerDeps{
 		db:              pool,
@@ -145,6 +154,7 @@ func run(logger *slog.Logger) error {
 		profileHandler:  handler.NewProfileHandler(profileUsecase),
 		resumeHandler:   handler.NewResumeHandler(resumeUsecase),
 		eventHandler:    handler.NewEventHandler(eventUsecase),
+		streamHandler:   handler.NewStreamHandler(liveStatsUsecase, authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)),
 		eventLimiter:    authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
 		authHandler:     handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
 		authenticator:   authUsecase,
@@ -202,6 +212,7 @@ type routerDeps struct {
 	profileHandler  *handler.ProfileHandler
 	resumeHandler   *handler.ResumeHandler
 	eventHandler    *handler.EventHandler
+	streamHandler   *handler.StreamHandler          // F5 SSE live feed, exempt from the request timeout
 	eventLimiter    func(http.Handler) http.Handler // per-IP rate limit for event ingest
 	authHandler     *handler.AuthHandler
 	authenticator   authmw.Authenticator
@@ -209,12 +220,12 @@ type routerDeps struct {
 }
 
 func newRouter(d routerDeps) http.Handler {
-	r := chi.NewRouter()
+	root := chi.NewRouter()
 
 	// CORS goes first so it intercepts preflight requests. Origins must be
 	// explicit: with AllowCredentials a wildcard would let any site use the
 	// admin session cookie.
-	r.Use(cors.Handler(cors.Options{
+	root.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   d.allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
@@ -225,11 +236,21 @@ func newRouter(d routerDeps) http.Handler {
 
 	// Logging and stability middleware. ClientIP replaces chi's RealIP: it only
 	// trusts CF-Connecting-IP, and only when running behind Cloudflare Tunnel.
-	r.Use(middleware.RequestID)
-	r.Use(authmw.ClientIP(d.trustCloudflare))
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(requestTimeout))
+	root.Use(middleware.RequestID)
+	root.Use(authmw.ClientIP(d.trustCloudflare))
+	root.Use(middleware.Logger)
+	root.Use(middleware.Recoverer)
+
+	// F5 live feed: a long-lived SSE stream. It is mounted on the root router,
+	// before the Timeout below is attached, because middleware.Timeout (25 s)
+	// would cancel it; the handler clears the connection write deadline itself
+	// so the server WriteTimeout (30 s) does not cut it either.
+	if d.streamHandler != nil {
+		root.Get("/api/v1/events/stream", d.streamHandler.Stream)
+	}
+
+	// Everything else is a short request and gets the 25 s timeout.
+	r := root.With(middleware.Timeout(requestTimeout))
 
 	// Infrastructure routes.
 	r.Get("/healthz", handleHealthz)
@@ -307,7 +328,7 @@ func newRouter(d routerDeps) http.Handler {
 		})
 	})
 
-	return r
+	return root
 }
 
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
