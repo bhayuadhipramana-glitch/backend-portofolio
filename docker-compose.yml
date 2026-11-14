@@ -18,6 +18,21 @@ services:
       timeout: 5s
       retries: 5
 
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: portofolio_valkey
+    restart: unless-stopped
+    # Pure cache (no persistence): bounded memory, least-recently-used eviction.
+    command: ["valkey-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    ports:
+      # Loopback only: the cache must never be reachable from the LAN.
+      - "127.0.0.1:${VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   pgdata:
     driver: local
