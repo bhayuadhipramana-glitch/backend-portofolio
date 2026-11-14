@@ -22,6 +22,9 @@ const (
 
 	// defaultValkeyAddr is the loopback address of the docker-compose Valkey.
 	defaultValkeyAddr = "127.0.0.1:6379"
+
+	// defaultNATSURL is the loopback address of the docker-compose NATS server.
+	defaultNATSURL = "nats://127.0.0.1:4222"
 )
 
 // config holds every setting read from the environment.
@@ -30,6 +33,7 @@ type config struct {
 	port        string
 	databaseURL string
 	valkeyAddr  string // host:port of the L2 cache
+	natsURL     string // NATS JetStream URL for event ingest and the worker
 
 	// trustCloudflare makes the API take the client IP from CF-Connecting-IP.
 	// Enable it only when the API is reachable exclusively through the tunnel.
@@ -51,6 +55,7 @@ type config struct {
 //	DATABASE_URL             PostgreSQL connection string (required)
 //	VALKEY_ADDR              Valkey host:port for the L2 cache (default 127.0.0.1:6379)
 //	GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_REDIRECT_URL, ADMIN_GITHUB_ID  (required)
+//	NATS_URL                 NATS JetStream URL (default nats://127.0.0.1:4222)
 //	CORS_ALLOWED_ORIGINS     comma-separated exact origins (required unless APP_ENV is local)
 //	TRUST_CLOUDFLARE_TUNNEL  "true" to trust CF-Connecting-IP (default false)
 //	AUTH_SUCCESS_URL         where to redirect after a successful login (default: JSON response)
@@ -60,6 +65,7 @@ func loadConfig() (config, error) {
 		port:            os.Getenv("PORT"),
 		databaseURL:     os.Getenv("DATABASE_URL"),
 		valkeyAddr:      strings.TrimSpace(os.Getenv("VALKEY_ADDR")),
+		natsURL:         strings.TrimSpace(os.Getenv("NATS_URL")),
 		trustCloudflare: strings.EqualFold(os.Getenv("TRUST_CLOUDFLARE_TUNNEL"), "true"),
 		clientID:        os.Getenv("GITHUB_CLIENT_ID"),
 		clientSecret:    os.Getenv("GITHUB_CLIENT_SECRET"),
@@ -71,6 +77,9 @@ func loadConfig() (config, error) {
 	}
 	if cfg.valkeyAddr == "" {
 		cfg.valkeyAddr = defaultValkeyAddr
+	}
+	if cfg.natsURL == "" {
+		cfg.natsURL = defaultNATSURL
 	}
 	if cfg.port == "" {
 		cfg.port = defaultPort

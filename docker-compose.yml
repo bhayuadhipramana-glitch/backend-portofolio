@@ -33,6 +33,28 @@ services:
       timeout: 3s
       retries: 5
 
+  nats:
+    image: nats:2.10-alpine
+    container_name: portofolio_nats
+    restart: unless-stopped
+    # JetStream with bounded memory/file stores (limits live in the config file,
+    # because nats-server has no CLI flags for them); 8222 is the monitoring port.
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    ports:
+      # Loopback only: the broker must never be reachable from the LAN.
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - ./deploy/nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+      - natsdata:/data/jetstream
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   pgdata:
+    driver: local
+  natsdata:
     driver: local
