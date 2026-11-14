@@ -14,32 +14,35 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("GITHUB_REDIRECT_URL", "http://localhost/cb")
 	t.Setenv("ADMIN_GITHUB_ID", "1")
 	t.Setenv("CONTACT_WEBHOOK_URL", "")
+	t.Setenv("CI_BENCHMARK_TOKEN", "")
 }
 
-func TestLoadConfigOptionalF9Settings(t *testing.T) {
+func TestLoadConfigOptionalF8F9Settings(t *testing.T) {
 	setRequiredEnv(t)
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("unset optional settings must be accepted: %v", err)
 	}
-	if cfg.contactWebhookURL != "" {
-		t.Fatalf("default should be empty, got %q", cfg.contactWebhookURL)
+	if cfg.contactWebhookURL != "" || cfg.ciBenchmarkToken != "" {
+		t.Fatalf("defaults should be empty, got %q / %q", cfg.contactWebhookURL, cfg.ciBenchmarkToken)
 	}
 
 	t.Setenv("CONTACT_WEBHOOK_URL", " https://hooks.example.com/x ")
+	t.Setenv("CI_BENCHMARK_TOKEN", strings.Repeat("a", 32))
 	cfg, err = loadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.contactWebhookURL != "https://hooks.example.com/x" {
-		t.Fatalf("webhook not loaded: %q", cfg.contactWebhookURL)
+	if cfg.contactWebhookURL != "https://hooks.example.com/x" || len(cfg.ciBenchmarkToken) != 32 {
+		t.Fatalf("settings not loaded: %q / %d chars", cfg.contactWebhookURL, len(cfg.ciBenchmarkToken))
 	}
 }
 
-func TestLoadConfigRejectsBadF9Settings(t *testing.T) {
+func TestLoadConfigRejectsBadF8F9Settings(t *testing.T) {
 	tests := []struct{ name, key, value, want string }{
 		{"webhook not a URL", "CONTACT_WEBHOOK_URL", "not a url", "CONTACT_WEBHOOK_URL"},
 		{"webhook wrong scheme", "CONTACT_WEBHOOK_URL", "ftp://example.com/x", "CONTACT_WEBHOOK_URL"},
+		{"short CI token", "CI_BENCHMARK_TOKEN", "short", "CI_BENCHMARK_TOKEN"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

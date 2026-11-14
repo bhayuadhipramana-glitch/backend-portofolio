@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -164,27 +165,34 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init contact usecase: %w", err)
 	}
 
+	benchmarkUsecase, err := usecase.NewBenchmarkUsecase(postgres.NewBenchmarkRepository(pool), contentCache)
+	if err != nil {
+		return fmt.Errorf("init benchmark usecase: %w", err)
+	}
+
 	// 5. Router and handlers.
 	router := newRouter(routerDeps{
-		db:              pool,
-		cache:           contentCache,
-		bus:             natsClient,
-		appEnv:          cfg.appEnv,
-		trustCloudflare: cfg.trustCloudflare,
-		projectHandler:  handler.NewProjectHandler(projectUsecase),
-		articleHandler:  handler.NewArticleHandler(articleUsecase),
-		profileHandler:  handler.NewProfileHandler(profileUsecase),
-		resumeHandler:   handler.NewResumeHandler(resumeUsecase),
-		eventHandler:    handler.NewEventHandler(eventUsecase),
-		demoHandler:     handler.NewDemoHandler(demoUsecase),
-		demoLimiter:     authmw.NewWindowLimiter(demoBurstsPerIP, time.Minute).Middleware,
-		contactHandler:  handler.NewContactHandler(contactUsecase),
-		contactLimiter:  authmw.NewWindowLimiter(contactPerIP, contactWindow).Middleware,
-		streamHandler:   handler.NewStreamHandler(liveStatsUsecase, authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)),
-		eventLimiter:    authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
-		authHandler:     handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
-		authenticator:   authUsecase,
-		allowedOrigins:  cfg.allowedOrigin,
+		db:               pool,
+		cache:            contentCache,
+		bus:              natsClient,
+		appEnv:           cfg.appEnv,
+		trustCloudflare:  cfg.trustCloudflare,
+		projectHandler:   handler.NewProjectHandler(projectUsecase),
+		articleHandler:   handler.NewArticleHandler(articleUsecase),
+		profileHandler:   handler.NewProfileHandler(profileUsecase),
+		resumeHandler:    handler.NewResumeHandler(resumeUsecase),
+		eventHandler:     handler.NewEventHandler(eventUsecase),
+		demoHandler:      handler.NewDemoHandler(demoUsecase),
+		demoLimiter:      authmw.NewWindowLimiter(demoBurstsPerIP, time.Minute).Middleware,
+		contactHandler:   handler.NewContactHandler(contactUsecase),
+		contactLimiter:   authmw.NewWindowLimiter(contactPerIP, contactWindow).Middleware,
+		benchmarkHandler: handler.NewBenchmarkHandler(benchmarkUsecase),
+		benchmarkToken:   cfg.ciBenchmarkToken,
+		streamHandler:    handler.NewStreamHandler(liveStatsUsecase, authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)),
+		eventLimiter:     authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
+		authHandler:      handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
+		authenticator:    authUsecase,
+		allowedOrigins:   cfg.allowedOrigin,
 	})
 
 	// 6. F4 aggregation worker, running alongside the HTTP server.
@@ -253,25 +261,27 @@ func connectDatabase(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 
 // routerDeps carries everything newRouter needs to build the HTTP routes.
 type routerDeps struct {
-	db              pinger
-	cache           pinger // Valkey health; an outage degrades readiness, it does not fail it
-	bus             pinger // NATS health; an outage degrades readiness, it does not fail it
-	appEnv          string
-	trustCloudflare bool
-	projectHandler  *handler.ProjectHandler
-	articleHandler  *handler.ArticleHandler
-	profileHandler  *handler.ProfileHandler
-	resumeHandler   *handler.ResumeHandler
-	eventHandler    *handler.EventHandler
-	demoHandler     *handler.DemoHandler
-	demoLimiter     func(http.Handler) http.Handler // per-IP sliding-window limit for demo bursts
-	contactHandler  *handler.ContactHandler
-	contactLimiter  func(http.Handler) http.Handler // per-IP sliding window for contact submissions
-	streamHandler   *handler.StreamHandler          // F5 SSE live feed, exempt from the request timeout
-	eventLimiter    func(http.Handler) http.Handler // per-IP rate limit for event ingest
-	authHandler     *handler.AuthHandler
-	authenticator   authmw.Authenticator
-	allowedOrigins  []string
+	db               pinger
+	cache            pinger // Valkey health; an outage degrades readiness, it does not fail it
+	bus              pinger // NATS health; an outage degrades readiness, it does not fail it
+	appEnv           string
+	trustCloudflare  bool
+	projectHandler   *handler.ProjectHandler
+	articleHandler   *handler.ArticleHandler
+	profileHandler   *handler.ProfileHandler
+	resumeHandler    *handler.ResumeHandler
+	eventHandler     *handler.EventHandler
+	demoHandler      *handler.DemoHandler
+	demoLimiter      func(http.Handler) http.Handler // per-IP sliding-window limit for demo bursts
+	contactHandler   *handler.ContactHandler
+	contactLimiter   func(http.Handler) http.Handler // per-IP sliding window for contact submissions
+	benchmarkHandler *handler.BenchmarkHandler
+	benchmarkToken   string                          // CI bearer token for POST /benchmarks; empty disables it
+	streamHandler    *handler.StreamHandler          // F5 SSE live feed, exempt from the request timeout
+	eventLimiter     func(http.Handler) http.Handler // per-IP rate limit for event ingest
+	authHandler      *handler.AuthHandler
+	authenticator    authmw.Authenticator
+	allowedOrigins   []string
 }
 
 func newRouter(d routerDeps) http.Handler {
@@ -375,6 +385,14 @@ func newRouter(d routerDeps) http.Handler {
 			})
 		}
 
+		// F8 benchmark history: public cached read; publishing needs the admin
+		// session or the CI bearer token.
+		if d.benchmarkHandler != nil {
+			r.With(authmw.CacheStatus).Get("/benchmarks", d.benchmarkHandler.List)
+			r.With(authmw.BearerOrAdmin(d.benchmarkToken, trustedOrigin, requireAdmin)).
+				Post("/benchmarks", d.benchmarkHandler.Create)
+		}
+
 		// Admin-only: unfiltered reads and all mutations.
 		r.Group(func(r chi.Router) {
 			r.Use(trustedOrigin, requireAdmin)
@@ -382,6 +400,18 @@ func newRouter(d routerDeps) http.Handler {
 			if d.contactHandler != nil {
 				r.Get("/admin/contacts", d.contactHandler.AdminList)
 			}
+
+			// Profiling. Never public. Requests run under the 25 s timeout and the
+			// 30 s server WriteTimeout, so use /profile?seconds=20 or less.
+			r.Get("/admin/debug/pprof/", pprof.Index)
+			r.Get("/admin/debug/pprof/cmdline", pprof.Cmdline)
+			r.Get("/admin/debug/pprof/profile", pprof.Profile)
+			r.Get("/admin/debug/pprof/symbol", pprof.Symbol)
+			r.Post("/admin/debug/pprof/symbol", pprof.Symbol)
+			r.Get("/admin/debug/pprof/trace", pprof.Trace)
+			r.Get("/admin/debug/pprof/{name}", func(w http.ResponseWriter, r *http.Request) {
+				pprof.Handler(chi.URLParam(r, "name")).ServeHTTP(w, r)
+			})
 
 			r.Get("/admin/articles", d.articleHandler.AdminList)
 			r.Get("/admin/articles/{id}", d.articleHandler.AdminGetByID)

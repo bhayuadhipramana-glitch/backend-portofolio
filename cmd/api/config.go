@@ -26,6 +26,9 @@ const (
 
 	// defaultNATSURL is the loopback address of the docker-compose NATS server.
 	defaultNATSURL = "nats://127.0.0.1:4222"
+
+	// minCIBenchmarkTokenLen rejects guessable CI tokens at startup.
+	minCIBenchmarkTokenLen = 32
 )
 
 // config holds every setting read from the environment.
@@ -48,6 +51,7 @@ type config struct {
 	successURL    string   // optional browser redirect after login
 
 	contactWebhookURL string // optional: F9 outbox delivers contact notifications here; empty means log-only
+	ciBenchmarkToken  string // optional: bearer token CI uses to publish F8 benchmarks; empty disables it
 }
 
 // loadConfig reads and validates the environment. It fails fast when a
@@ -63,6 +67,7 @@ type config struct {
 //	TRUST_CLOUDFLARE_TUNNEL  "true" to trust CF-Connecting-IP (default false)
 //	AUTH_SUCCESS_URL         where to redirect after a successful login (default: JSON response)
 //	CONTACT_WEBHOOK_URL      optional http(s) URL that receives contact notifications (default: log only)
+//	CI_BENCHMARK_TOKEN       optional bearer token for CI to POST /api/v1/benchmarks (min 32 characters)
 func loadConfig() (config, error) {
 	cfg := config{
 		appEnv:          strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))),
@@ -77,6 +82,7 @@ func loadConfig() (config, error) {
 		successURL:      os.Getenv("AUTH_SUCCESS_URL"),
 
 		contactWebhookURL: strings.TrimSpace(os.Getenv("CONTACT_WEBHOOK_URL")),
+		ciBenchmarkToken:  strings.TrimSpace(os.Getenv("CI_BENCHMARK_TOKEN")),
 	}
 	if cfg.appEnv == "" {
 		cfg.appEnv = envLocal
@@ -115,6 +121,9 @@ func loadConfig() (config, error) {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return config{}, errors.New("environment variable CONTACT_WEBHOOK_URL must be an absolute http(s) URL")
 		}
+	}
+	if cfg.ciBenchmarkToken != "" && len(cfg.ciBenchmarkToken) < minCIBenchmarkTokenLen {
+		return config{}, fmt.Errorf("environment variable CI_BENCHMARK_TOKEN must be at least %d characters", minCIBenchmarkTokenLen)
 	}
 
 	origins := os.Getenv("CORS_ALLOWED_ORIGINS")

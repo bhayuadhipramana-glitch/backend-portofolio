@@ -72,6 +72,12 @@ Reads that differ between visitors and the admin take a `domain.Visibility`; the
 - Shutdown: a dispatch round that has started finishes (its context is detached from the shutdown signal). `main` waits for the dispatcher before draining NATS and before the deferred `pool.Close`.
 - Admin inbox: `GET /api/v1/admin/contacts` (`RequireAdmin`, `?limit=&offset=`, newest first).
 
+## Benchmarks & Admin pprof (F8)
+- `GET /api/v1/benchmarks` is public, paginated and cache-aside under namespace `benchmarks` (`domain.CacheNamespaceBenchmarks`, `X-Cache` header). `BenchmarkUsecase.Create` calls `invalidate` after the insert, so a new run is visible at once.
+- `POST /api/v1/benchmarks` is authorized by `middleware.BearerOrAdmin`: either `Authorization: Bearer <CI_BENCHMARK_TOKEN>` (GitHub Actions publishing k6 results) or, when no `Authorization` header is present, an admin session (with `TrustedOrigin`). The token is compared in constant time (`crypto/subtle` over SHA-256 digests). A bearer header never falls back to the session: a wrong token, or any bearer while `CI_BENCHMARK_TOKEN` is unset, is `401`.
+- `CI_BENCHMARK_TOKEN` is optional, min 32 characters (validated at startup, `openssl rand -hex 32`), and lives in `.env` / a Kubernetes Secret / a GitHub Actions secret, never in the repo. The CI token authorizes **only** `POST /benchmarks`; it must never unlock any other route.
+- `net/http/pprof` is mounted only at `/api/v1/admin/debug/pprof/*` inside the admin group (`TrustedOrigin` + `RequireAdmin`). Never import it for side effects or expose it on `DefaultServeMux`/a public router. Requests run under the 25 s `Timeout` and 30 s `WriteTimeout`, so profile with `?seconds=20` or less, e.g. `go tool pprof https://<host>/api/v1/admin/debug/pprof/profile?seconds=20` with the admin session cookie.
+
 ## Database & Migration Rules (PostgreSQL 17)
 - Single source of truth for schema: `migrations/` (`000001_name.up.sql` and `.down.sql`). Do NOT create `db/migrations/`.
 - Always use parameterized queries (`$1`, `$2`). Never concatenate user input into SQL strings.
