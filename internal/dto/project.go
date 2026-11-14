@@ -7,7 +7,11 @@
 package dto
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -21,10 +25,34 @@ var (
 	validate *validator.Validate
 )
 
+// slugPattern accepts lowercase alphanumeric words separated by single hyphens.
+var slugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// IsSlug reports whether s is a valid article slug (same rule as the "slug" tag).
+func IsSlug(s string) bool {
+	return len(s) <= 255 && slugPattern.MatchString(s)
+}
+
 // getValidator returns the singleton validator instance.
 func getValidator() *validator.Validate {
 	once.Do(func() {
 		validate = validator.New(validator.WithRequiredStructEnabled())
+		// Report errors under the JSON key rather than the Go field name.
+		validate.RegisterTagNameFunc(func(f reflect.StructField) string {
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			if name == "" || name == "-" {
+				return f.Name
+			}
+			return name
+		})
+		_ = validate.RegisterValidation("slug", func(fl validator.FieldLevel) bool {
+			return slugPattern.MatchString(fl.Field().String())
+		})
+		// jsonobject accepts a json.RawMessage holding a syntactically valid JSON object.
+		_ = validate.RegisterValidation("jsonobject", func(fl validator.FieldLevel) bool {
+			b := bytes.TrimSpace(fl.Field().Bytes())
+			return len(b) > 0 && b[0] == '{' && json.Valid(b)
+		})
 	})
 	return validate
 }
@@ -94,6 +122,16 @@ func msgForTag(fe validator.FieldError) string {
 		return fmt.Sprintf("%s is required", jsonFieldName(fe.Field()))
 	case "max":
 		return fmt.Sprintf("%s must be at most %s characters", jsonFieldName(fe.Field()), fe.Param())
+	case "email":
+		return fmt.Sprintf("%s must be a valid email address", jsonFieldName(fe.Field()))
+	case "url":
+		return fmt.Sprintf("%s must be a valid URL", jsonFieldName(fe.Field()))
+	case "slug":
+		return fmt.Sprintf("%s must be lowercase letters, digits and single hyphens", jsonFieldName(fe.Field()))
+	case "jsonobject":
+		return fmt.Sprintf("%s must be a valid JSON object", jsonFieldName(fe.Field()))
+	case "oneof":
+		return fmt.Sprintf("%s must be one of: %s", jsonFieldName(fe.Field()), fe.Param())
 	case "min":
 		return fmt.Sprintf("%s must have at least %s item(s)", jsonFieldName(fe.Field()), fe.Param())
 	default:
