@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -45,6 +46,8 @@ type config struct {
 	adminGithubID int64    // numeric GitHub user id of the single admin
 	allowedOrigin []string // exact origins allowed for CORS and for cookie-authenticated mutations
 	successURL    string   // optional browser redirect after login
+
+	contactWebhookURL string // optional: F9 outbox delivers contact notifications here; empty means log-only
 }
 
 // loadConfig reads and validates the environment. It fails fast when a
@@ -59,6 +62,7 @@ type config struct {
 //	CORS_ALLOWED_ORIGINS     comma-separated exact origins (required unless APP_ENV is local)
 //	TRUST_CLOUDFLARE_TUNNEL  "true" to trust CF-Connecting-IP (default false)
 //	AUTH_SUCCESS_URL         where to redirect after a successful login (default: JSON response)
+//	CONTACT_WEBHOOK_URL      optional http(s) URL that receives contact notifications (default: log only)
 func loadConfig() (config, error) {
 	cfg := config{
 		appEnv:          strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))),
@@ -71,6 +75,8 @@ func loadConfig() (config, error) {
 		clientSecret:    os.Getenv("GITHUB_CLIENT_SECRET"),
 		redirectURL:     os.Getenv("GITHUB_REDIRECT_URL"),
 		successURL:      os.Getenv("AUTH_SUCCESS_URL"),
+
+		contactWebhookURL: strings.TrimSpace(os.Getenv("CONTACT_WEBHOOK_URL")),
 	}
 	if cfg.appEnv == "" {
 		cfg.appEnv = envLocal
@@ -103,6 +109,13 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("environment variable ADMIN_GITHUB_ID must be a positive integer")
 	}
 	cfg.adminGithubID = id
+
+	if cfg.contactWebhookURL != "" {
+		u, err := url.Parse(cfg.contactWebhookURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return config{}, errors.New("environment variable CONTACT_WEBHOOK_URL must be an absolute http(s) URL")
+		}
+	}
 
 	origins := os.Getenv("CORS_ALLOWED_ORIGINS")
 	if strings.TrimSpace(origins) == "" {

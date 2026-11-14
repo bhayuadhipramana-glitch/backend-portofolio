@@ -24,6 +24,7 @@ import (
 	authmw "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/middleware"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/github"
 	natsbus "github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/nats"
+	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/notify"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/postgres"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/platform/valkey"
 	"github.com/bhayuadhipramana-glicth/backend-portofolio/internal/usecase"
@@ -45,6 +46,10 @@ const (
 	// F7 abuse protection: bursts per client IP per minute. The server-wide cap
 	// on concurrent bursts is domain.DemoMaxConcurrency.
 	demoBurstsPerIP = 2
+
+	// F9 abuse protection: contact submissions per client IP per window.
+	contactPerIP  = 3
+	contactWindow = 10 * time.Minute
 
 	// SSE guardrails: total concurrent live-feed clients and the share per IP.
 	maxStreamClients = 100
@@ -154,6 +159,11 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init demo burst usecase: %w", err)
 	}
 
+	contactUsecase, err := usecase.NewContactUsecase(postgres.NewContactRepository(pool))
+	if err != nil {
+		return fmt.Errorf("init contact usecase: %w", err)
+	}
+
 	// 5. Router and handlers.
 	router := newRouter(routerDeps{
 		db:              pool,
@@ -168,6 +178,8 @@ func run(logger *slog.Logger) error {
 		eventHandler:    handler.NewEventHandler(eventUsecase),
 		demoHandler:     handler.NewDemoHandler(demoUsecase),
 		demoLimiter:     authmw.NewWindowLimiter(demoBurstsPerIP, time.Minute).Middleware,
+		contactHandler:  handler.NewContactHandler(contactUsecase),
+		contactLimiter:  authmw.NewWindowLimiter(contactPerIP, contactWindow).Middleware,
 		streamHandler:   handler.NewStreamHandler(liveStatsUsecase, authmw.NewConnLimiter(maxStreamClients, maxStreamsPerIP)),
 		eventLimiter:    authmw.NewRateLimiter(eventRatePerSecond, eventBurst).Middleware,
 		authHandler:     handler.NewAuthHandler(authUsecase, cfg.appEnv, cfg.successURL, sessionTTL),
@@ -190,6 +202,21 @@ func run(logger *slog.Logger) error {
 		_ = aggregator.Run(ctx) // Run only returns once ctx is cancelled
 	}()
 
+	// F9 outbox dispatcher: delivers contact notifications after commit.
+	notifier, err := notify.New(cfg.contactWebhookURL, logger)
+	if err != nil {
+		return err
+	}
+	dispatcher, err := worker.NewOutboxDispatcher(postgres.NewOutboxRepository(pool), notifier, logger)
+	if err != nil {
+		return fmt.Errorf("init outbox dispatcher: %w", err)
+	}
+	outboxDone := make(chan struct{})
+	go func() {
+		defer close(outboxDone)
+		_ = dispatcher.Run(ctx) // Run only returns once ctx is cancelled
+	}()
+
 	serveErr := serve(ctx, logger, newServer(router, cfg.port))
 
 	// Shutdown order: stop the HTTP server (done), let the worker finish its
@@ -204,6 +231,11 @@ func run(logger *slog.Logger) error {
 	case <-workerDone:
 	case <-time.After(shutdownTimeout):
 		logger.Warn("aggregation worker did not stop in time")
+	}
+	select {
+	case <-outboxDone:
+	case <-time.After(shutdownTimeout):
+		logger.Warn("outbox dispatcher did not stop in time")
 	}
 	if err := natsClient.Drain(); err != nil {
 		logger.Warn("nats drain failed", "error", err)
@@ -233,6 +265,8 @@ type routerDeps struct {
 	eventHandler    *handler.EventHandler
 	demoHandler     *handler.DemoHandler
 	demoLimiter     func(http.Handler) http.Handler // per-IP sliding-window limit for demo bursts
+	contactHandler  *handler.ContactHandler
+	contactLimiter  func(http.Handler) http.Handler // per-IP sliding window for contact submissions
 	streamHandler   *handler.StreamHandler          // F5 SSE live feed, exempt from the request timeout
 	eventLimiter    func(http.Handler) http.Handler // per-IP rate limit for event ingest
 	authHandler     *handler.AuthHandler
@@ -331,9 +365,23 @@ func newRouter(d routerDeps) http.Handler {
 			})
 		}
 
+		// F9 public contact form: strict per-IP sliding window before any write.
+		if d.contactHandler != nil {
+			r.Group(func(r chi.Router) {
+				if d.contactLimiter != nil {
+					r.Use(d.contactLimiter)
+				}
+				r.Post("/contact", d.contactHandler.Submit)
+			})
+		}
+
 		// Admin-only: unfiltered reads and all mutations.
 		r.Group(func(r chi.Router) {
 			r.Use(trustedOrigin, requireAdmin)
+
+			if d.contactHandler != nil {
+				r.Get("/admin/contacts", d.contactHandler.AdminList)
+			}
 
 			r.Get("/admin/articles", d.articleHandler.AdminList)
 			r.Get("/admin/articles/{id}", d.articleHandler.AdminGetByID)

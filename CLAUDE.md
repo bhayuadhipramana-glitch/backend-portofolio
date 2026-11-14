@@ -24,6 +24,7 @@ Actual package layout (do NOT rename or move to `internal/adapter/*`):
 - `internal/platform/nats`: JetStream `domain.EventPublisher` (F3) and `domain.EventSource` durable pull consumer (F4), plus stream setup.
 - `internal/worker`: Background F4 aggregation loop (`Aggregator`). Depends only on `internal/domain` ports.
 - `internal/platform/valkey`: `domain.ContentCache` as a two-layer cache (see Caching Conventions).
+- `internal/platform/notify`: `domain.ContactNotifier` (webhook POST or log-only fallback) used by the F9 outbox worker.
 - Future adapters follow the same pattern.
 - `cmd/api`: Process entrypoint, environment config (`config.go`), router and dependency wiring.
 
@@ -61,6 +62,15 @@ Reads that differ between visitors and the admin take a `domain.Visibility`; the
 - It answers `202` at once. `usecase.DemoBurstUsecase` then publishes synthetic events (`source: "demo-burst"`, `page_view` 50 % / `api_read` 30 % / `cache_hit` 20 %) in 100 ms slices through the normal `EventUsecase`, so they travel NATS -> worker -> Postgres -> SSE like real traffic. Never write demo events straight to the database.
 - **Abuse protection, both required:** a sliding-window per-IP limit of 2 bursts/minute (`middleware.WindowLimiter`, `429` + `Retry-After`; it is deliberately not a token bucket, which would allow 3 in the first minute) and a server-wide semaphore of 2 concurrent bursts (`domain.DemoMaxConcurrency`, `503` + `Retry-After` when busy). The limiter runs before the usecase, so a throttled visitor never reaches NATS.
 - Bursts run on the process context passed to `NewDemoBurstUsecase`, not the request context, so they survive the 202 response and stop on shutdown. `main` calls `Wait` before draining NATS.
+
+## Contact Form & Outbox (F9)
+- `POST /api/v1/contact` (public) decodes with `decodeJSONLimit` (32 KB, `DisallowUnknownFields`) and validates name (<=120), email (<=254), subject (<=200), message (10..4000 chars, trimmed first). A non-empty honeypot field `website` answers `202` **before validation** and writes nothing, so bots cannot tell they were dropped.
+- Abuse protection: sliding-window `middleware.WindowLimiter`, 3 submissions per 10 minutes per client IP (`429` + `Retry-After`), applied before the usecase. The stored `ip_hash` is the SHA-256 hex of `r.RemoteAddr` (`usecase.HashIP`); never store or log the raw IP, and never expose `ip_hash` in a response.
+- **Transactional outbox:** `contacts` and `outbox` rows are inserted in ONE Postgres transaction (`ContactRepository.CreateWithOutbox`). Never notify, call a webhook, or publish to NATS from the request path; side effects go through a new outbox `event_type` and the dispatcher. The outbox payload carries everything the notifier needs (it must not contain `ip_hash`).
+- `worker.OutboxDispatcher` polls every 2 s (immediately again while work remains). `OutboxRepository.Dispatch` claims up to 10 due rows (`status IN ('pending','failed') AND next_attempt_at <= NOW()`) with `FOR UPDATE SKIP LOCKED`, delivers inside the claiming transaction and records the outcome: `sent`, `failed` (next attempt after `OutboxBackoff`: 30 s doubling, capped at 1 h) or `dead` after `domain.OutboxMaxAttempts` (5). Delivery is at-least-once, so receivers deduplicate on the `X-Outbox-Id` header.
+- Notifier: `CONTACT_WEBHOOK_URL` (optional, http/https) gets the payload as a JSON POST with a 10 s timeout; any non-2xx is a failure and is retried. Unset means log-only, and logs carry ids only, never visitor data.
+- Shutdown: a dispatch round that has started finishes (its context is detached from the shutdown signal). `main` waits for the dispatcher before draining NATS and before the deferred `pool.Close`.
+- Admin inbox: `GET /api/v1/admin/contacts` (`RequireAdmin`, `?limit=&offset=`, newest first).
 
 ## Database & Migration Rules (PostgreSQL 17)
 - Single source of truth for schema: `migrations/` (`000001_name.up.sql` and `.down.sql`). Do NOT create `db/migrations/`.
