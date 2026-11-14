@@ -6,7 +6,7 @@ Go modular monolith + background aggregation worker proving p99 read latency < 5
 ## Build, Format, and Verification (Run Before Finishing Every Task)
 - Format: `gofmt -w .`
 - Static analysis: `go vet ./...`
-- Tests with race detector: `go test -race ./...` (needs cgo; on Windows without gcc run it in Docker: `docker run --rm -v "$PWD:/src" -w /src golang:1.24 go test -race ./...`)
+- Tests with race detector: `go test -race ./...` (needs cgo; on Windows without gcc run it in Docker: `docker run --rm -v "$PWD:/src" -w /src golang:1.27 go test -race ./...`)
 - Never mark a task complete if `gofmt -l .` produces output or tests fail.
 - Every new repository, usecase, middleware, or HTTP handler MUST ship with `_test.go` unit or integration tests in the same commit.
 
@@ -87,6 +87,17 @@ Reads that differ between visitors and the admin take a `domain.Visibility`; the
 - `GET /metrics` is registered on the timeout router in `newRouter` and guarded by `observability.MetricsAccess(METRICS_TOKEN)`. With a token: only `Authorization: Bearer <token>` (constant time), else `401`. Without one: the peer must be loopback/private **and** the request must carry no `CF-Connecting-IP`, `Cf-Ray`, `X-Forwarded-For`, `X-Real-IP` or `Forwarded` header, else `403`, so nothing that came through the tunnel can read it. Set `METRICS_TOKEN` (min 32 chars) in production. The token unlocks nothing else.
 - Traces: `OTEL_EXPORTER_OTLP_ENDPOINT` (optional absolute http(s) URL, OTLP/HTTP). Unset means a no-op tracer and no spans are created. Metrics work either way.
 - Dashboard: `deploy/grafana/portfolio-dashboard.json` (import, pick the Prometheus data source). It charts p50/p95/p99 (with the 50 ms line), RPS, 5xx ratio, L1/L2/miss ratio, SSE streams, NATS published vs consumed, outbox backlog and delivery outcomes. Renaming a metric means updating the dashboard in the same commit.
+
+## Container Image & k3s Deployment (single Proxmox node)
+- `Dockerfile` is multi-stage: `build` (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`, `golang:${GO_VERSION}-alpine`; keep `GO_VERSION` >= the `go` line of `go.mod`) -> `migrate` (golang-migrate with `migrations/` baked in, target `--target migrate`) -> `api` (default, `gcr.io/distroless/static-debian12:nonroot`, uid 65532, port 8080). Distroless has no shell, so probes are always `httpGet`.
+- The API never migrates itself. Apply schema changes with `deploy/k8s/migrate-job.yaml` (delete the old Job first; a Job is immutable).
+- Manifests live in `deploy/k8s/` and apply in this order: `namespace.yaml`, `configmap.yaml`, `secret.yaml` (copy of `secret.example.yaml`, **gitignored**), `postgres.yaml`, `valkey.yaml`, `nats.yaml`, `migrate-job.yaml`, `api-deployment.yaml`, `cloudflared.yaml`, `backup-cronjob.yaml`. Everything is in namespace `portfolio`; settings are split into ConfigMap `portfolio-config` (non-secret) and Secret `portfolio-secrets`.
+- Images are built on the node and imported (`docker save <img> | sudo k3s ctr images import -`) with `imagePullPolicy: IfNotPresent`: no registry, no recurring cost.
+- API probes: `startupProbe` and `livenessProbe` on `/healthz` (never dependency-aware, so a database blip cannot restart the pod), `readinessProbe` on `/readyz` (fails only without PostgreSQL). Keep `terminationGracePeriodSeconds` >= the 15 s shutdown timeout. One replica on purpose (per-pod L1 cache, small node).
+- Resource budget (requests/limits): api 100m/128Mi - 2 CPU/256Mi, postgres 100m/256Mi - 1 CPU/512Mi, valkey 50m/160Mi - 500m/224Mi (`--maxmemory 128mb` + overhead), nats 50m/128Mi - 500m/256Mi, cloudflared 20m/32Mi - 300m/128Mi. Raise a limit only with a measured reason.
+- Every pod sets `runAsNonRoot`, `seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false` and drops all capabilities; use `readOnlyRootFilesystem: true` unless the image needs a writable path (postgres), and mount `emptyDir` for scratch space.
+- Valkey and NATS stay `ClusterIP`; nothing but `cloudflared` reaches the API from outside. Point the tunnel's public hostname at `http://portfolio-api.portfolio.svc.cluster.local:8080` and never publish a route for `/metrics` (the API refuses Cloudflare-carried requests anyway). `TRUST_CLOUDFLARE_TUNNEL=true` is correct only in this topology.
+- Pin third-party image tags (`postgres:17-alpine`, `valkey/valkey:8-alpine`, `nats:2.10-alpine`, `cloudflare/cloudflared:<release>`); never `latest` for them. `kubeconform -strict deploy/k8s` must pass (CI runs it).
 
 ## Database & Migration Rules (PostgreSQL 17)
 - Single source of truth for schema: `migrations/` (`000001_name.up.sql` and `.down.sql`). Do NOT create `db/migrations/`.

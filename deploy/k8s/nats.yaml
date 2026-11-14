@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: nats, app.kubernetes.io/part-of: portfolio}
+spec:
+  selector: {app.kubernetes.io/name: nats}
+  ports:
+    - {name: client, port: 4222, targetPort: client}
+    - {name: monitor, port: 8222, targetPort: monitor}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: nats, app.kubernetes.io/part-of: portfolio}
+spec:
+  serviceName: nats
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: nats}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: nats, app.kubernetes.io/part-of: portfolio}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          args: ["-c", "/etc/nats/nats-server.conf"]
+          ports:
+            - {name: client, containerPort: 4222}
+            - {name: monitor, containerPort: 8222}
+          readinessProbe:
+            httpGet: {path: /healthz, port: monitor}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: monitor}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            # 64 MB memory store + 256 MB file store (nats-config ConfigMap).
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/nats, readOnly: true}
+            - {name: data, mountPath: /data/jetstream}
+      volumes:
+        - name: config
+          configMap: {name: nats-config}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels: {app.kubernetes.io/name: nats, app.kubernetes.io/part-of: portfolio}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests: {storage: 1Gi}

@@ -1,0 +1,39 @@
+# Non-secret settings. Secrets (DATABASE_URL, tokens, OAuth) live in the
+# portfolio-secrets Secret; see secret.example.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portfolio-config
+  namespace: portfolio
+  labels:
+    app.kubernetes.io/part-of: portfolio
+data:
+  APP_ENV: "production"
+  PORT: "8080"
+  # The API is reachable only through cloudflared, so CF-Connecting-IP is trusted.
+  TRUST_CLOUDFLARE_TUNNEL: "true"
+  VALKEY_ADDR: "valkey:6379"
+  NATS_URL: "nats://nats:4222"
+  # TODO: replace the example.com hosts with your own domains before applying.
+  GITHUB_REDIRECT_URL: "https://api.example.com/api/v1/auth/github/callback"
+  CORS_ALLOWED_ORIGINS: "https://www.example.com"
+  AUTH_SUCCESS_URL: "https://www.example.com/admin"
+  # Traces are optional: uncomment when an OTLP/HTTP collector exists in the cluster.
+  # OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+---
+# Same limits as deploy/nats/nats-server.conf (docker-compose); store_dir sits on the PVC.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: portfolio
+  labels:
+    app.kubernetes.io/part-of: portfolio
+data:
+  nats-server.conf: |
+    http: 8222
+    jetstream {
+      store_dir: /data/jetstream
+      max_memory_store: 64MB
+      max_file_store: 256MB
+    }

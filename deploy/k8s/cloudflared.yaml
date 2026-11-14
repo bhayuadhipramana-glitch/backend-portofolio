@@ -1,0 +1,56 @@
+# Cloudflare Tunnel ingress (remotely-managed tunnel): no inbound port is opened on
+# the Proxmox host. In the Zero Trust dashboard (Networks > Tunnels) add a public
+# hostname that points at:
+#     http://portfolio-api.portfolio.svc.cluster.local:8080
+# and put the tunnel token into the portfolio-secrets Secret as TUNNEL_TOKEN.
+#
+# Do NOT publish a route for /metrics: the API already refuses it for anything that
+# carries Cloudflare headers, and Prometheus scrapes the Service inside the cluster.
+# Pin the image to the release you have verified (https://github.com/cloudflare/cloudflared/releases).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: cloudflared, app.kubernetes.io/part-of: portfolio}
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app.kubernetes.io/name: cloudflared}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: cloudflared, app.kubernetes.io/part-of: portfolio}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2025.11.1
+          args: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: TUNNEL_TOKEN}}
+          ports:
+            - {name: metrics, containerPort: 2000}
+          livenessProbe:
+            httpGet: {path: /ready, port: metrics}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /ready, port: metrics}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {cpu: 300m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}

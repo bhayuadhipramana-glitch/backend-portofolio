@@ -32,3 +32,5 @@ Thumbs.db
 
 *.log
 coverage.out
+# 5. Real Kubernetes secrets (secret.example.yaml is the committed template)
+deploy/k8s/secret.yaml

@@ -1,0 +1,61 @@
+# Pure cache: no persistence, bounded memory, LRU eviction (same flags as docker-compose).
+# Never store secrets, sessions or admin data here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: valkey, app.kubernetes.io/part-of: portfolio}
+spec:
+  selector: {app.kubernetes.io/name: valkey}
+  ports:
+    - {name: valkey, port: 6379, targetPort: valkey}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: valkey, app.kubernetes.io/part-of: portfolio}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: valkey}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: valkey, app.kubernetes.io/part-of: portfolio}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: valkey
+          image: valkey/valkey:8-alpine
+          args: ["valkey-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+          ports:
+            - {name: valkey, containerPort: 6379}
+          readinessProbe:
+            exec: {command: ["valkey-cli", "ping"]}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: {command: ["valkey-cli", "ping"]}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            # 128 MB maxmemory plus process overhead.
+            requests: {cpu: 50m, memory: 160Mi}
+            limits: {cpu: 500m, memory: 224Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          emptyDir: {sizeLimit: 64Mi}

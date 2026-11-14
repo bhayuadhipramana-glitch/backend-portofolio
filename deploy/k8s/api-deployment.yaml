@@ -1,0 +1,97 @@
+# API + background workers (one process). Single replica on purpose: the in-process
+# L1 cache is per pod and the single-node homelab budget is tight. Build the image
+# on the node and import it (no registry needed):
+#   docker build -t portfolio-api:latest .
+#   docker save portfolio-api:latest | sudo k3s ctr images import -
+apiVersion: v1
+kind: Service
+metadata:
+  name: portfolio-api
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: portfolio-api, app.kubernetes.io/part-of: portfolio}
+spec:
+  selector: {app.kubernetes.io/name: portfolio-api}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portfolio-api
+  namespace: portfolio
+  labels: {app.kubernetes.io/name: portfolio-api, app.kubernetes.io/part-of: portfolio}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app.kubernetes.io/name: portfolio-api}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: portfolio-api, app.kubernetes.io/part-of: portfolio}
+      annotations:
+        # For a Prometheus using annotation discovery. /metrics needs the bearer
+        # METRICS_TOKEN: put it in the scrape job's authorization credentials.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Matches the API's 15 s graceful shutdown (HTTP, worker batch, NATS drain).
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: api
+          image: portfolio-api:latest
+          imagePullPolicy: IfNotPresent # image is imported into k3s, not pulled
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - configMapRef: {name: portfolio-config}
+          env:
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: DATABASE_URL}}
+            - name: GITHUB_CLIENT_ID
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: GITHUB_CLIENT_ID}}
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: GITHUB_CLIENT_SECRET}}
+            - name: ADMIN_GITHUB_ID
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: ADMIN_GITHUB_ID}}
+            - name: CI_BENCHMARK_TOKEN
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: CI_BENCHMARK_TOKEN, optional: true}}
+            - name: METRICS_TOKEN
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: METRICS_TOKEN, optional: true}}
+            - name: CONTACT_WEBHOOK_URL
+              valueFrom: {secretKeyRef: {name: portfolio-secrets, key: CONTACT_WEBHOOK_URL, optional: true}}
+          # The process exits at boot when Postgres, Valkey or NATS is unreachable
+          # (fail fast), so the startup probe only has to outlast a slow node.
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          # Liveness never checks dependencies: a Postgres blip must not restart the API.
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Readiness fails only when PostgreSQL is down; Valkey/NATS outages degrade
+          # (200 "ready (cache degraded)") instead of removing the pod.
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "2", memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
